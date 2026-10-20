@@ -1,0 +1,5 @@
+/target/
+# Captures saved while testing in the repository root.
+/*.png
+/*.webp
+/*.tiff

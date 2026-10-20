@@ -1,0 +1,42 @@
+[package]
+name = "alphashot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Capture Windows windows with transparent backgrounds, rounded corners and shadows"
+authors = ["Thomas Frase <11775534+Sofahamster@users.noreply.github.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sofahamster/alphashot"
+readme = "README.md"
+keywords = ["screenshot", "windows", "transparency", "capture", "dwm"]
+categories = ["command-line-utilities", "multimedia::images"]
+include = ["/src", "/tests", "/README.md", "/LICENSE-*", "/Cargo.toml", "/Cargo.lock"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-pc-windows-msvc"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+icy_sixel = "0.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "webp", "tiff"] }
+png = "0.18"
+tempfile = "3"
+tiff = "0.11"
+unicode-width = "0.2.2"
+
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3.5"
+windows = { version = "0.62", features = ["Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
