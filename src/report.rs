@@ -53,15 +53,26 @@ pub(crate) fn styled() -> bool {
         && !env::var("TERM").is_ok_and(|value| value == "dumb")
 }
 
+/// True for characters that must not reach the terminal unescaped: controls, which start escape
+/// sequences or break lines, and bidi overrides, isolates and line separators, which rearrange
+/// the rest of the line.
+///
+/// `char::escape_debug` alone also escapes emoji joiners, variation selectors and combining
+/// marks, which turns `❤️` into `❤\u{fe0f}` and `é` written as `e` + U+0301 into `e\u{301}`.
+pub(crate) fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}')
+}
+
 /// Escapes control characters in untrusted text (window titles, paths) so they
-/// cannot inject terminal escape sequences. Backslashes and quotes stay literal.
+/// cannot inject terminal escape sequences. Everything else stays literal.
 fn clean(value: &str) -> String {
     let mut text = String::new();
     for c in value.chars() {
-        if matches!(c, '\\' | '\'' | '"') {
-            text.push(c);
-        } else {
+        if needs_escape(c) {
             text.extend(c.escape_debug());
+        } else {
+            text.push(c);
         }
     }
     text
@@ -328,6 +339,18 @@ mod tests {
         assert!(plain.contains("capture white.png") && plain.contains("capture black.png"));
         assert!(!plain.contains('\x1b'));
         assert!(!plain.contains("Ctrl+click"));
+    }
+
+    #[test]
+    fn titles_keep_emoji_and_combining_marks_but_escape_controls() {
+        assert_eq!(
+            clean("❤️ Café\u{301} हिन्दी 👨‍👩‍👧 C:\\x \"q\""),
+            "❤️ Café\u{301} हिन्दी 👨‍👩‍👧 C:\\x \"q\""
+        );
+        assert_eq!(
+            clean("a\x1b[2J\u{9b}b\u{202e}c\nd"),
+            "a\\u{1b}[2J\\u{9b}b\\u{202e}c\\nd"
+        );
     }
 
     #[test]
