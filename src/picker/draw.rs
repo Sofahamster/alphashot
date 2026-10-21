@@ -322,7 +322,9 @@ impl View {
                 if self.modal {
                     return None;
                 }
-                if mouse.column == self.rows.x + self.rows.w
+                // The scrollbar column only jumps when a scrollbar is drawn.
+                if picker.matches.len() > self.visible
+                    && mouse.column == self.rows.x + self.rows.w
                     && mouse.row >= self.rows.y
                     && mouse.row < self.rows.y + self.rows.h
                 {
