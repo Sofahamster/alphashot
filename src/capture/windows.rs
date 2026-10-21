@@ -448,7 +448,10 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
     Ok(result)
 }
 
-/// Returns the window under the cursor, or its root owner with `root_owner`.
+/// Returns the top-level window under the cursor, or its root owner with `root_owner`.
+///
+/// `WindowFromPoint` returns the deepest child control; a child cannot be captured because
+/// the backdrop is a top-level window and cannot sit between a child and its parent.
 pub fn pick_cursor(root_owner: bool) -> Result<usize> {
     enable_per_monitor_dpi();
     let mut point = POINT::default();
@@ -459,7 +462,18 @@ pub fn pick_cursor(root_owner: bool) -> Result<usize> {
     // SAFETY: WindowFromPoint takes the point by value and returns null when nothing is there.
     let hwnd = unsafe { WindowFromPoint(point) };
     ensure!(!hwnd.is_null(), "No window under the cursor");
-    Ok(if root_owner { root(hwnd) } else { hwnd } as usize)
+    Ok(if root_owner {
+        root(hwnd)
+    } else {
+        top_level(hwnd)
+    } as usize)
+}
+
+/// Returns the top-level window that contains `hwnd`, or `hwnd` itself if it has no parent.
+fn top_level(hwnd: HWND) -> HWND {
+    // SAFETY: GetAncestor takes plain values and returns null for invalid handles.
+    let top = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if top.is_null() { hwnd } else { top }
 }
 
 /// Window procedure for overlays; `DefWindowProcW` paints the class brush as background.
@@ -1268,6 +1282,11 @@ pub fn capture(
         // SAFETY: IsWindowVisible takes the handle by value and returns 0 for invalid windows.
         unsafe { IsWindowVisible(hwnd) } != 0 && !cloaked(hwnd),
         "Target must be a visible window on the current desktop"
+    );
+    ensure!(
+        top_level(hwnd) == hwnd,
+        "Target 0x{handle:X} is a child control; capture its top-level window 0x{:X} instead",
+        top_level(hwnd) as usize
     );
     let menus = open_menus(hwnd)?;
     ensure!(
