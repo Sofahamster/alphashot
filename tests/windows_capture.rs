@@ -693,6 +693,113 @@ fn nudges_animated_windows_restores_after_cancel_and_captures_maximized_windows(
     );
 }
 
+#[test]
+#[ignore = "Uses an interactive Windows desktop, moves the cursor over a disposable test window and mirrors it"]
+fn picks_top_level_windows_and_keeps_mirrored_clients_opaque() {
+    let _desktop = DESKTOP_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::new();
+    let class: Vec<u16> = "BUTTON".encode_utf16().chain(Some(0)).collect();
+    let child = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            null(),
+            WS_CHILD | WS_VISIBLE,
+            20,
+            20,
+            120,
+            60,
+            fixture.hwnd,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        )
+    };
+    assert!(!child.is_null());
+    let mut point = POINT { x: 80, y: 50 };
+    unsafe {
+        ClientToScreen(fixture.hwnd, &mut point);
+        SetCursorPos(point.x, point.y);
+        // The new window may need a moment to be shown above other windows.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while WindowFromPoint(point) != child && std::time::Instant::now() < until {
+            let mut message = zeroed();
+            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            WindowFromPoint(point),
+            child,
+            "Button must be under the cursor"
+        );
+    }
+    assert_eq!(capture::pick_cursor(false).unwrap(), fixture.hwnd as usize);
+    let error = capture::capture(
+        child as usize,
+        &CaptureOptions::default(),
+        &AtomicBool::new(false),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("child control"), "{error}");
+    unsafe {
+        DestroyWindow(child);
+        let style = GetWindowLongPtrW(fixture.hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(fixture.hwnd, GWL_EXSTYLE, style | WS_EX_LAYOUTRTL as isize);
+        SetWindowPos(
+            fixture.hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        // Mirrored: client x = 0 maps to the right edge of the client area.
+        let mut origin = POINT::default();
+        ClientToScreen(fixture.hwnd, &mut origin);
+        assert!(origin.x > frame(fixture.hwnd).left + 100);
+        SetWindowLongPtrW(fixture.hwnd, GWLP_USERDATA, 1);
+        assert_ne!(SetTimer(fixture.hwnd, 2, 20, None), 0);
+    }
+    let pair = capture::capture(
+        fixture.hwnd as usize,
+        &CaptureOptions::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    unsafe {
+        KillTimer(fixture.hwnd, 2);
+    }
+    let image = recover(
+        &pair.white,
+        &pair.black,
+        &AlphaOptions {
+            crop: false,
+            opaque_regions: pair.opaque_regions.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .image;
+    let (x, y) = (image.width() / 2, image.height() / 2);
+    assert!(
+        pair.opaque_regions
+            .iter()
+            .any(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height),
+        "The client center must be opaque: {:?}",
+        pair.opaque_regions
+    );
+    assert_eq!(image[(x, y)][3], 255);
+    assert_eq!(&image[(x, y)].0[..3], &pair.black[(x, y)].0);
+}
+
 unsafe extern "system" fn menu_fixture_proc(
     hwnd: HWND,
     message: u32,
