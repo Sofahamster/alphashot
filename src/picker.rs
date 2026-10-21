@@ -216,11 +216,13 @@ impl Picker {
                 self.query.clear();
                 self.refilter();
             }
+            // Windows reports AltGr as Ctrl+Alt, so Ctrl and Alt together still type a character
+            // (`@`, `\`, `{` on German and French layouts). Ctrl or Alt alone does not.
             KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && !character.is_control() =>
+                if !character.is_control() && {
+                    let held = key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+                    held.is_empty() || held == KeyModifiers::CONTROL | KeyModifiers::ALT
+                } =>
             {
                 self.query.push(character);
                 self.refilter();
@@ -358,6 +360,18 @@ mod tests {
             picker.key(KeyCode::Enter.into(), 10, &mut args).unwrap(),
             Some(Selection::Window(10))
         );
+        // AltGr arrives as Ctrl+Alt on Windows; Ctrl or Alt alone types nothing.
+        picker.query.clear();
+        for modifiers in [
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            picker
+                .key(KeyEvent::new(KeyCode::Char('@'), modifiers), 10, &mut args)
+                .unwrap();
+        }
+        assert_eq!(picker.query, "@");
         picker.query = "ÉD".into();
         picker.refilter();
         assert_eq!(picker.matches, [1]);
