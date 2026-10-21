@@ -1218,18 +1218,19 @@ fn unchanged_outside(a: &RgbImage, b: &RgbImage, regions: &[image::math::Rect]) 
 /// corner squares stay in the alpha solve.
 fn opaque_regions(hwnd: HWND, frame: Rect, capture: Rect) -> Result<Vec<image::math::Rect>> {
     let mut client = RECT::default();
-    let mut origin = POINT::default();
-    // SAFETY: `client` and `origin` are live locals.
+    // SAFETY: `client` is a live RECT, which is two consecutive POINTs. With exactly two points,
+    // MapWindowPoints swaps left and right for mirrored (WS_EX_LAYOUTRTL) windows, where client
+    // x = 0 is the right edge; ClientToScreen of the origin would give the wrong corner there.
     unsafe {
         check(GetClientRect(hwnd, &mut client), "GetClientRect")?;
-        check(ClientToScreen(hwnd, &mut origin), "ClientToScreen")?;
+        MapWindowPoints(
+            hwnd,
+            null_mut(),
+            (&mut client as *mut RECT).cast::<POINT>(),
+            2,
+        );
     }
-    let client = Rect {
-        left: origin.x,
-        top: origin.y,
-        right: origin.x + client.right,
-        bottom: origin.y + client.bottom,
-    };
+    let client = rect(client);
     // SAFETY: GetDpiForWindow takes the handle by value and returns 0 for invalid windows.
     let radius = (16 * unsafe { GetDpiForWindow(hwnd) }.max(96) / 96) as i32;
     let mut regions = Vec::new();
