@@ -292,9 +292,23 @@ fn write_capture(
     Ok(())
 }
 
+/// Escapes a TSV text field as `escape_debug` does, but only for controls, bidi controls,
+/// backslashes and quotes, so emoji and combining marks stay readable.
+fn tsv_field(value: &str) -> String {
+    let mut text = String::new();
+    for c in value.chars() {
+        if report::needs_escape(c) || matches!(c, '\\' | '\'' | '"') {
+            text.extend(c.escape_debug());
+        } else {
+            text.push(c);
+        }
+    }
+    text
+}
+
 /// Writes the window table as tab-separated values with a header row.
 ///
-/// `escape_debug` keeps each window on one line.
+/// Escaping keeps each window on one line.
 fn print_windows(windows: &[WindowInfo], mut stream: impl Write) -> Result<()> {
     writeln!(stream, "hwnd\tpid\tprocess\twidth\theight\tdpi\ttitle")?;
     for window in windows {
@@ -303,15 +317,11 @@ fn print_windows(windows: &[WindowInfo], mut stream: impl Write) -> Result<()> {
             "0x{:X}\t{}\t{}\t{}\t{}\t{}\t{}",
             window.handle,
             window.pid,
-            window
-                .process_name
-                .as_deref()
-                .unwrap_or("<unknown>")
-                .escape_debug(),
+            tsv_field(window.process_name.as_deref().unwrap_or("<unknown>")),
             window.rect.width(),
             window.rect.height(),
             window.dpi,
-            window.title.escape_debug()
+            tsv_field(&window.title)
         )?;
     }
     Ok(())
@@ -338,7 +348,7 @@ fn print_displays(monitors: &[MonitorInfo], mut stream: impl Write) -> Result<()
             monitor.work.height(),
             monitor.dpi,
             monitor.dpi * 100 / 96,
-            monitor.description.escape_debug()
+            tsv_field(&monitor.description)
         )?;
     }
     Ok(())
@@ -612,7 +622,7 @@ mod tests {
         let window = WindowInfo {
             handle: 0xab,
             pid: 7,
-            title: "a\tb".into(),
+            title: "a\tb ❤️ \"x\"".into(),
             process_name: None,
             rect: rect(0, 0, 640, 480),
             dpi: 96,
@@ -622,7 +632,7 @@ mod tests {
         print_windows(&[window], &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "hwnd\tpid\tprocess\twidth\theight\tdpi\ttitle\n0xAB\t7\t<unknown>\t640\t480\t96\ta\\tb\n"
+            "hwnd\tpid\tprocess\twidth\theight\tdpi\ttitle\n0xAB\t7\t<unknown>\t640\t480\t96\ta\\tb ❤️ \\\"x\\\"\n"
         );
         let monitor = MonitorInfo {
             name: "DISPLAY1".into(),
