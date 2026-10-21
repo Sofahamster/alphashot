@@ -135,13 +135,7 @@ impl Worker {
                         .iter()
                         .position(|entry| entry.window == request.window);
                     let mut entry = position.and_then(|i| cache.remove(i)).unwrap_or_else(|| {
-                        let image = capture(request.window, &cancelled).ok().map(|image| {
-                            if image.width() > 1024 || image.height() > 768 {
-                                imageops::thumbnail(&image, 1024, 768)
-                            } else {
-                                image
-                            }
-                        });
+                        let image = capture(request.window, &cancelled).ok().map(downsize);
                         Cached {
                             window: request.window,
                             image,
@@ -314,9 +308,36 @@ impl Preview {
     }
 }
 
+/// Scales a snapshot down to fit 1024x768, keeping its aspect ratio.
+///
+/// `imageops::thumbnail` resizes to exactly the given size, so the target is computed here.
+fn downsize(image: RgbaImage) -> RgbaImage {
+    let (width, height) = image.dimensions();
+    if width <= 1024 && height <= 768 {
+        return image;
+    }
+    let scale = (1024.0 / f64::from(width)).min(768.0 / f64::from(height));
+    let width = (f64::from(width) * scale).round().max(1.0) as u32;
+    let height = (f64::from(height) * scale).round().max(1.0) as u32;
+    imageops::thumbnail(&image, width, height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downsizing_keeps_the_aspect_ratio() {
+        for (size, expected) in [
+            ((1920, 1080), (1024, 576)),
+            ((500, 1400), (274, 768)),
+            ((4000, 1), (1024, 1)),
+            ((640, 480), (640, 480)),
+        ] {
+            let image = RgbaImage::new(size.0, size.1);
+            assert_eq!(downsize(image).dimensions(), expected, "{size:?}");
+        }
+    }
 
     fn request(handle: usize, pixels: (u32, u32)) -> Request {
         Request {
