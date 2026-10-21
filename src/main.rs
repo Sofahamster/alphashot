@@ -134,7 +134,7 @@ struct Cli {
     /// Overlay picker border thickness in physical pixels.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=32))]
     pick_overlay_border_thickness: u32,
-    /// Pick the child window under the cursor instead of its root owner.
+    /// Pick the owned window under the cursor (e.g. a dialog) instead of its root owner.
     #[arg(long)]
     pick_child: bool,
     /// Capture the window's focused or unfocused appearance.
