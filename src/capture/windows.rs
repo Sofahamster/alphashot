@@ -30,7 +30,7 @@
 //! 2. Require a visible target that DWM does not cloak. DWM cloaks windows on other virtual
 //!    desktops and suspended UWP frames.
 //! 3. Collect open native menus with [`open_menus`]. An open menu rules out unfocused capture,
-//!    `--high-dpi` and activation, because each of them dismisses the menu.
+//!    `--high-dpi`, `--client-size` and activation, because each dismisses the menu.
 //! 4. Record placement and foreground window in [`Restore`]. If the foreground is to be restored
 //!    or the unfocused look is requested, call `AllowSetForegroundWindow` for this process while
 //!    the foreground lock still permits it; the later `SetForegroundWindow` calls need it.
@@ -39,15 +39,17 @@
 //!    composites. Unfocused capture adds an activatable 1x1 off-screen focus sink.
 //! 6. With `--high-dpi`, center the target on the chosen monitor and require it to report that
 //!    monitor's DPI. DWM bitmap-stretches DPI-unaware windows, which blurs the composites.
-//! 7. Restore a minimized target. Activate it unless its root owner is already the foreground
+//! 7. Restore a minimized target, or a maximized target with `--client-size`, then apply the
+//!    requested physical client dimensions, measuring and adjusting for the application's frame.
+//!    Activate it unless its root owner is already the foreground
 //!    root, then wait 80 ms: some activation animations, such as Windows Terminal's caption
 //!    buttons, pause between frames, and the stability check would accept such a frame.
 //! 8. For the unfocused look, activate the focus sink so the target draws its inactive frame.
 //!    The capture fails if the resulting foreground root does not match the requested state.
 //! 9. Compute the capture rectangle: DWM extended frame bounds plus shadow margins and `--pad`.
 //!    If it leaves the monitor workspace and no menu is open, [`fit_workspace`] moves or shrinks
-//!    the window. Menu rectangles with style 1 margins join the union, which must stay on the
-//!    virtual screen.
+//!    the window; an explicit client size permits movement only. Menu rectangles with style 1
+//!    margins join the union, which must stay on the virtual screen.
 //! 10. Snapshot the cursor before the backdrops appear. Inside the capture rectangle it becomes
 //!     a layer over the recovered image, with an optional drop shadow below it.
 //! 11. Compute [`opaque_regions`], which the stability check ignores and the solver treats as
@@ -74,6 +76,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::{Dwm::*, Gdi::*},
@@ -215,6 +219,23 @@ fn window_rect(hwnd: HWND) -> Result<Rect> {
     }
     Ok(rect(bounds))
 }
+/// Returns the physical client rectangle on the screen, including mirrored client layouts.
+fn client_rect(hwnd: HWND) -> Result<Rect> {
+    let mut client = RECT::default();
+    // SAFETY: `client` is a live RECT, which is two consecutive POINTs. With exactly two points,
+    // MapWindowPoints swaps left and right for mirrored (WS_EX_LAYOUTRTL) windows, where client
+    // x = 0 is the right edge; ClientToScreen of the origin would give the wrong corner there.
+    unsafe {
+        check(GetClientRect(hwnd, &mut client), "GetClientRect")?;
+        MapWindowPoints(
+            hwnd,
+            null_mut(),
+            (&mut client as *mut RECT).cast::<POINT>(),
+            2,
+        );
+    }
+    Ok(rect(client))
+}
 /// Returns the DWM extended frame bounds, which exclude the invisible resize borders, or the
 /// window rectangle if DWM fails.
 fn extended(hwnd: HWND) -> Result<Rect> {
@@ -234,6 +255,188 @@ fn extended(hwnd: HWND) -> Result<Rect> {
     } else {
         window_rect(hwnd)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ShadowPolicy {
+    blend_space: crate::alpha::BlendSpace,
+    corner_radius: f32,
+}
+
+/// Standard DWM frames use an approximate mask; per-pixel layered sources stay unmasked.
+fn validate_no_shadow(hwnd: HWND, options: &CaptureOptions) -> Result<ShadowPolicy> {
+    if !options.no_shadow {
+        return Ok(ShadowPolicy::default());
+    }
+    ensure!(
+        open_menus(hwnd)?.is_empty(),
+        "--no-shadow cannot separate open menu shadows; close the menu and retry"
+    );
+    // SAFETY: the error state is thread-local. A zero extended style is valid on success.
+    let (extended_style, style_error) = unsafe {
+        windows_sys::Win32::Foundation::SetLastError(0);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        (style, windows_sys::Win32::Foundation::GetLastError())
+    };
+    ensure!(
+        extended_style != 0 || style_error == 0,
+        "--no-shadow could not read target window styles: Win32 error {style_error}"
+    );
+    let layered = extended_style & WS_EX_LAYERED as isize != 0;
+    // SAFETY: IsZoomed accepts the handle by value and returns false for invalid handles.
+    let maximized = unsafe { IsZoomed(hwnd) } != 0;
+    if !layered && shadow_free_maximized(maximized, options) {
+        return Ok(ShadowPolicy::default());
+    }
+    if layered {
+        ensure!(
+            shadow_free_layered(hwnd),
+            "--no-shadow cannot mask this layered window safely; forced DWM rounding or an unknown shadow policy is unsupported"
+        );
+        return Ok(ShadowPolicy {
+            blend_space: crate::alpha::BlendSpace::Srgb,
+            corner_radius: 0.0,
+        });
+    }
+    // SAFETY: these calls only read the live window's style and DPI.
+    let (style, dpi) = unsafe {
+        (
+            GetWindowLongPtrW(hwnd, GWL_STYLE) as u32,
+            GetDpiForWindow(hwnd),
+        )
+    };
+    let frame = extended(hwnd)?;
+    let client = client_rect(hwnd)?;
+    let metric = if extended_style & WS_EX_TOOLWINDOW as isize != 0 {
+        SM_CYSMCAPTION
+    } else {
+        SM_CYCAPTION
+    };
+    let mut non_client = 0_i32;
+    let mut region = RECT::default();
+    // SAFETY: the metric and DPI are plain inputs; DWM writes to the live BOOL and RECT.
+    let native = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_ENABLED as u32,
+            (&mut non_client as *mut i32).cast(),
+            size_of::<i32>() as u32,
+        ) >= 0
+            && non_client != 0
+            && GetWindowRgnBox(hwnd, &mut region) == ERROR
+            && native_frame(style, frame, client, GetSystemMetricsForDpi(metric, dpi))
+    };
+    ensure!(
+        native,
+        "--no-shadow corner masking requires a standard DWM caption and frame; custom chrome, window regions and unidentifiable frames are unsupported"
+    );
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
+        // SAFETY: OSVERSIONINFOW contains only integers and a fixed UTF-16 array.
+        ..unsafe { zeroed() }
+    };
+    ensure!(
+        // SAFETY: RtlGetVersion writes the initialized, correctly sized OSVERSIONINFOW.
+        unsafe { RtlGetVersion(&mut version) } >= 0,
+        "--no-shadow could not query the Windows version"
+    );
+    let mut preference = -1_i32;
+    // SAFETY: DWM writes the corner-preference enum to the live i32.
+    let preference = (unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&mut preference as *mut i32).cast(),
+            size_of::<i32>() as u32,
+        )
+    } >= 0)
+        .then_some(preference);
+    // SAFETY: these predicates read window/session state without changing it.
+    let square = unsafe {
+        IsZoomed(hwnd) != 0
+            || IsWindowArranged(hwnd) != 0
+            || GetSystemMetrics(SM_REMOTESESSION) != 0
+    };
+    Ok(ShadowPolicy {
+        blend_space: crate::alpha::BlendSpace::Srgb,
+        corner_radius: standard_corner_radius(preference, version.dwBuildNumber, dpi, square)?,
+    })
+}
+
+fn native_frame(style: u32, frame: Rect, client: Rect, caption_height: i32) -> bool {
+    style & WS_CAPTION == WS_CAPTION
+        && style & WS_CHILD == 0
+        && caption_height > 0
+        && frame.contains(client)
+        && client.width() > 0
+        && client.height() > 0
+        && client.top - frame.top >= caption_height
+}
+
+fn standard_corner_radius(
+    preference: Option<i32>,
+    build: u32,
+    dpi: u32,
+    square: bool,
+) -> Result<f32> {
+    ensure!(
+        build >= 18362 && dpi > 0,
+        "--no-shadow could not identify the Windows build or target DPI"
+    );
+    if build < 22000 || square {
+        return Ok(0.0);
+    }
+    // shortcut: calibrated standard-frame radii; revisit if Windows changes its geometry.
+    let radius = match preference {
+        Some(DWMWCP_DEFAULT | DWMWCP_ROUND) => 8.0,
+        Some(DWMWCP_ROUNDSMALL) => 4.0,
+        Some(DWMWCP_DONOTROUND) => 0.0,
+        _ => bail!("--no-shadow cannot identify this window's DWM corner preference"),
+    };
+    Ok(radius * dpi as f32 / 96.0)
+}
+
+fn shadow_free_layered(hwnd: HWND) -> bool {
+    let mut non_client = 1_i32;
+    let mut corner = -1_i32;
+    // SAFETY: DWM writes a BOOL to the live i32. Failure keeps the conservative default.
+    let non_client_result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_ENABLED as u32,
+            (&mut non_client as *mut i32).cast(),
+            size_of::<i32>() as u32,
+        )
+    };
+    // Forced DWM rounding adds frame/shadow pixels even when non-client rendering is disabled.
+    // SAFETY: DWM writes the documented corner-preference enum to the live i32.
+    let corner_result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&mut corner as *mut i32).cast(),
+            size_of::<i32>() as u32,
+        )
+    };
+    // SAFETY: both last-error functions affect only this thread. A zero class style is valid,
+    // so a cleared last error distinguishes it from a failed GetClassLongPtrW call.
+    let class_has_no_shadow = unsafe {
+        windows_sys::Win32::Foundation::SetLastError(0);
+        let style = GetClassLongPtrW(hwnd, GCL_STYLE);
+        (style != 0 || windows_sys::Win32::Foundation::GetLastError() == 0)
+            && style & CS_DROPSHADOW as usize == 0
+    };
+    non_client_result >= 0
+        && non_client == 0
+        && class_has_no_shadow
+        && corner_result >= 0
+        && matches!(corner, DWMWCP_DEFAULT | DWMWCP_DONOTROUND)
+}
+
+fn shadow_free_maximized(maximized: bool, options: &CaptureOptions) -> bool {
+    maximized
+        && (options.backend == CaptureBackend::Wgc
+            || (!options.high_dpi && options.client_size.is_none()))
 }
 /// Reports whether DWM cloaks the window, as it does for windows on other virtual desktops and
 /// suspended app frames that `IsWindowVisible` reports as visible.
@@ -350,8 +553,8 @@ pub fn window_info(handle: usize) -> Result<WindowInfo> {
     }
 }
 
-/// `EnumWindows` callback that keeps visible, non-minimized, uncloaked windows with a title and
-/// at least 80x60 pixels.
+/// `EnumWindows` callback that keeps visible, non-minimized, uncloaked windows of at least
+/// 80x60 pixels, including untitled windows selectable by process or class.
 ///
 /// # Safety
 ///
@@ -365,7 +568,6 @@ unsafe extern "system" fn enum_window(hwnd: HWND, data: LPARAM) -> i32 {
             && IsIconic(hwnd) == 0
             && !cloaked(hwnd)
             && let Ok(info) = window_info(hwnd as usize)
-            && !info.title.trim().is_empty()
             && info.rect.width() >= 80
             && info.rect.height() >= 60
         {
@@ -696,9 +898,13 @@ impl Drop for Overlay {
 /// Returns the root window the user clicks while hovering.
 ///
 /// Four topmost, click-through strips of `thickness` pixels frame the hovered window. `filter`
-/// limits hover targets to titles that contain it, ignoring case. Esc or `cancelled` aborts.
+/// limits hover targets to windows matching every selector. Esc or `cancelled` aborts.
 /// The loop polls mouse and keyboard state every 15 ms and installs no global hook.
-pub fn pick_overlay(filter: Option<&str>, thickness: u32, cancelled: &AtomicBool) -> Result<usize> {
+pub fn pick_overlay(
+    filter: &WindowFilter,
+    thickness: u32,
+    cancelled: &AtomicBool,
+) -> Result<usize> {
     enable_per_monitor_dpi();
     ensure!(
         (1..=32).contains(&thickness),
@@ -707,7 +913,6 @@ pub fn pick_overlay(filter: Option<&str>, thickness: u32, cancelled: &AtomicBool
     let borders = (0..4)
         .map(|_| Overlay::new(0x00ffaa00, false))
         .collect::<Result<Vec<_>>>()?;
-    let filter = filter.map(str::to_lowercase);
     let mut hovered = 0;
     // SAFETY: GetAsyncKeyState takes a virtual-key code by value.
     let mut button_was_down = unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON)) } < 0;
@@ -724,7 +929,7 @@ pub fn pick_overlay(filter: Option<&str>, thickness: u32, cancelled: &AtomicBool
         let info = window_info(handle).ok().filter(|info| unsafe { IsWindowVisible(hwnd) != 0 }
             && !cloaked(hwnd) && info.rect.width() >= 16 && info.rect.height() >= 16
             && !borders.iter().any(|border| border.hwnd == hwnd)
-            && filter.as_ref().is_none_or(|needle| info.title.to_lowercase().contains(needle)));
+            && filter.matches(info));
         let current = if info.is_some() { handle } else { 0 };
         if current != hovered {
             hovered = current;
@@ -1050,6 +1255,80 @@ fn move_window(hwnd: HWND, bounds: Rect) -> Result<()> {
     }
 }
 
+/// Refuses an application-constrained size rather than capturing different client dimensions.
+fn require_client_size(hwnd: HWND, requested: (u32, u32)) -> Result<()> {
+    let actual = client_rect(hwnd)?;
+    ensure!(
+        actual.width() == requested.0 as i32 && actual.height() == requested.1 as i32,
+        "Requested client size {}x{}; actual client size {}x{}. The application constrained or refused the requested size",
+        requested.0,
+        requested.1,
+        actual.width(),
+        actual.height()
+    );
+    Ok(())
+}
+
+/// Measures the application's actual frame after each resize; custom chrome can change it.
+fn resize_client(hwnd: HWND, requested: (u32, u32), cancelled: &AtomicBool) -> Result<()> {
+    for _ in 0..4 {
+        ensure!(!cancelled.load(Ordering::Relaxed), "Capture cancelled");
+        let client = client_rect(hwnd)?;
+        if client.width() == requested.0 as i32 && client.height() == requested.1 as i32 {
+            return Ok(());
+        }
+        let window = window_rect(hwnd)?;
+        let invalid = || {
+            format!(
+                "Requested client size {}x{}; actual client size {}x{}. The required outer size is invalid",
+                requested.0,
+                requested.1,
+                client.width(),
+                client.height()
+            )
+        };
+        let width = window
+            .width()
+            .checked_add(requested.0 as i32 - client.width())
+            .filter(|&value| value > 0)
+            .with_context(invalid)?;
+        let height = window
+            .height()
+            .checked_add(requested.1 as i32 - client.height())
+            .filter(|&value| value > 0)
+            .with_context(invalid)?;
+        // SAFETY: dimensions are positive and checked above; no pointers are passed. Keeping
+        // the position avoids moving to another monitor while adjusting the client size.
+        unsafe {
+            check(
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    width,
+                    height,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                ),
+                "Resize target client",
+            )
+            .with_context(|| {
+                let actual = client_rect(hwnd).unwrap_or(client);
+                format!(
+                    "Requested client size {}x{}; actual client size {}x{}",
+                    requested.0,
+                    requested.1,
+                    actual.width(),
+                    actual.height()
+                )
+            })?;
+        }
+        flush();
+        wait(Duration::from_millis(100), cancelled)?;
+    }
+    require_client_size(hwnd, requested)
+}
+
 /// Desktop state recorded before capture and restored in `Drop`.
 ///
 /// `move_back` is set once the capture restores, moves or resizes the target, so an untouched
@@ -1062,25 +1341,69 @@ struct Restore {
     original: Rect,
     move_back: bool,
     restore_foreground: bool,
+    nonactivating: bool,
+    original_dpi: u32,
+    original_monitor: usize,
+}
+impl Restore {
+    fn geometry(&mut self) -> Result<()> {
+        if !self.move_back {
+            return Ok(());
+        }
+        // SAFETY: the placement was initialized by GetWindowPlacement before any mutation.
+        let placed = unsafe {
+            ensure!(
+                IsWindow(self.target) != 0,
+                "Target closed before geometry restoration"
+            );
+            let mut placement = self.placement;
+            if self.nonactivating {
+                placement.showCmd = SW_SHOWNOACTIVATE as u32;
+            }
+            SetWindowPlacement(self.target, &placement) != 0
+        };
+        if !placed {
+            eprintln!("Warning: could not restore the target window placement");
+        }
+        flush();
+        thread::sleep(Duration::from_millis(120));
+        if self.placement.showCmd == SW_SHOWNORMAL as u32
+            && window_rect(self.target)? != self.original
+        {
+            move_window(self.target, self.original)?;
+            flush();
+            thread::sleep(Duration::from_millis(100));
+        }
+        if self.nonactivating {
+            ensure!(
+                window_rect(self.target)? == self.original,
+                "The application refused its original window geometry during restoration"
+            );
+            // SAFETY: these read-only queries accept the live HWND by value.
+            let actual = unsafe {
+                (
+                    GetDpiForWindow(self.target),
+                    MonitorFromWindow(self.target, MONITOR_DEFAULTTONEAREST) as usize,
+                )
+            };
+            ensure!(
+                actual == (self.original_dpi, self.original_monitor),
+                "The application did not return to its original monitor and DPI"
+            );
+            ensure!(placed, "Could not restore original target placement");
+        }
+        self.move_back = false;
+        Ok(())
+    }
 }
 impl Drop for Restore {
     fn drop(&mut self) {
+        if let Err(error) = self.geometry() {
+            eprintln!("Warning: could not restore target geometry: {error}");
+        }
         // SAFETY: both handles pass IsWindow before use; GetWindowPlacement filled `placement`
         // with `length` set.
         unsafe {
-            if self.move_back && IsWindow(self.target) != 0 {
-                if SetWindowPlacement(self.target, &self.placement) == 0 {
-                    eprintln!("Warning: could not restore the target window placement");
-                }
-                flush();
-                thread::sleep(Duration::from_millis(120));
-                if self.placement.showCmd == SW_SHOWNORMAL as u32
-                    && window_rect(self.target).ok() != Some(self.original)
-                    && let Err(error) = move_window(self.target, self.original)
-                {
-                    eprintln!("Warning: could not restore target geometry: {error}");
-                }
-            }
             if self.restore_foreground
                 && !self.foreground.is_null()
                 && IsWindow(self.foreground) != 0
@@ -1099,6 +1422,10 @@ impl Drop for Restore {
 /// exterior shadow and get neither margins nor padding.
 fn bounds(hwnd: HWND, options: &CaptureOptions) -> Result<Rect> {
     let ext = extended(hwnd)?;
+    if options.no_shadow {
+        validate_no_shadow(hwnd, options)?;
+        return Ok(ext);
+    }
     // SAFETY: IsZoomed takes the handle by value and returns 0 for invalid windows.
     if unsafe { IsZoomed(hwnd) } != 0 {
         return Ok(ext);
@@ -1123,7 +1450,8 @@ fn bounds(hwnd: HWND, options: &CaptureOptions) -> Result<Rect> {
 /// Moves the window until its capture rectangle lies inside `work` and returns that rectangle.
 ///
 /// Outside the workspace the taskbar or the screen edge hides the backdrops. A window larger
-/// than the workspace is shrunk and centered with `high_dpi` and rejected otherwise.
+/// than the workspace is shrunk and centered with `high_dpi` and rejected otherwise. An explicit
+/// client size always rejects shrinking.
 /// Applications may react to a move, so each attempt re-measures; four attempts are allowed.
 fn fit_workspace(
     hwnd: HWND,
@@ -1132,12 +1460,24 @@ fn fit_workspace(
     cancelled: &AtomicBool,
 ) -> Result<Rect> {
     for _ in 0..4 {
-        let capture = bounds(hwnd, options)?;
+        let capture = if options.backend == CaptureBackend::Wgc {
+            extended(hwnd)?
+        } else {
+            bounds(hwnd, options)?
+        };
         if work.contains(capture) {
             return Ok(capture);
         }
         let mut window = window_rect(hwnd)?;
         if capture.width() > work.width() || capture.height() > work.height() {
+            if let Some((width, height)) = options.client_size {
+                let actual = client_rect(hwnd)?;
+                bail!(
+                    "Requested client size {width}x{height}; actual client size {}x{}. The client, frame and shadow cannot fit this monitor's workspace; choose a smaller --client-size or a larger display",
+                    actual.width(),
+                    actual.height()
+                );
+            }
             ensure!(
                 options.high_dpi,
                 "The window and its shadow are larger than this monitor's workspace; resize the window or use --high-dpi"
@@ -1162,6 +1502,9 @@ fn fit_workspace(
         move_window(hwnd, window)?;
         flush();
         wait(Duration::from_millis(100), cancelled)?;
+        if let Some(requested) = options.client_size {
+            require_client_size(hwnd, requested)?;
+        }
     }
     bail!("The application would not fit within the monitor workspace, including its shadow")
 }
@@ -1217,20 +1560,7 @@ fn unchanged_outside(a: &RgbImage, b: &RgbImage, regions: &[image::math::Rect]) 
 /// between passes. Rounded corners are translucent even under custom client chrome, so the
 /// corner squares stay in the alpha solve.
 fn opaque_regions(hwnd: HWND, frame: Rect, capture: Rect) -> Result<Vec<image::math::Rect>> {
-    let mut client = RECT::default();
-    // SAFETY: `client` is a live RECT, which is two consecutive POINTs. With exactly two points,
-    // MapWindowPoints swaps left and right for mirrored (WS_EX_LAYOUTRTL) windows, where client
-    // x = 0 is the right edge; ClientToScreen of the origin would give the wrong corner there.
-    unsafe {
-        check(GetClientRect(hwnd, &mut client), "GetClientRect")?;
-        MapWindowPoints(
-            hwnd,
-            null_mut(),
-            (&mut client as *mut RECT).cast::<POINT>(),
-            2,
-        );
-    }
-    let client = rect(client);
+    let client = client_rect(hwnd)?;
     // SAFETY: GetDpiForWindow takes the handle by value and returns 0 for invalid windows.
     let radius = (16 * unsafe { GetDpiForWindow(hwnd) }.max(96) / 96) as i32;
     let mut regions = Vec::new();
@@ -1263,6 +1593,10 @@ pub fn capture(
     options: &CaptureOptions,
     cancelled: &AtomicBool,
 ) -> Result<Composites> {
+    ensure!(
+        options.backend == CaptureBackend::Backdrop,
+        "The WGC backend returns native RGBA; use capture_wgc instead of backdrop composites"
+    );
     enable_per_monitor_dpi();
     ensure!(!cancelled.load(Ordering::Relaxed), "Capture cancelled");
     ensure!(
@@ -1277,6 +1611,12 @@ pub fn capture(
         options.shadow_style.is_none_or(|style| style <= 5),
         "Shadow style must be between 0 and 5"
     );
+    ensure!(
+        options.client_size.is_none_or(|(width, height)| width > 0
+            && height > 0
+            && u64::from(width) * u64::from(height) <= 40_000_000),
+        "Client size must have positive dimensions and at most 40 million pixels"
+    );
     let hwnd = handle as HWND;
     let mut info = window_info(handle)?;
     ensure!(
@@ -1289,6 +1629,7 @@ pub fn capture(
         "Target 0x{handle:X} is a child control; capture its top-level window 0x{:X} instead",
         top_level(hwnd) as usize
     );
+    validate_no_shadow(hwnd, options)?;
     let menus = open_menus(hwnd)?;
     ensure!(
         menus.is_empty() || options.focus == FocusState::Focused,
@@ -1297,6 +1638,10 @@ pub fn capture(
     ensure!(
         menus.is_empty() || !options.high_dpi,
         "Move the window to the desired monitor before opening its menu; --high-dpi would dismiss the open menu"
+    );
+    ensure!(
+        menus.is_empty() || options.client_size.is_none(),
+        "Resize the window before opening its menu; --client-size would dismiss the open menu"
     );
     let destination = if options.high_dpi {
         Some(high_dpi_display(&list_monitors()?, options.high_dpi_display.as_deref())?.clone())
@@ -1322,8 +1667,11 @@ pub fn capture(
         placement,
         original: info.rect,
         // SAFETY: IsIconic takes the handle by value and returns 0 for invalid windows.
-        move_back: unsafe { IsIconic(hwnd) } != 0,
+        move_back: options.no_shadow || unsafe { IsIconic(hwnd) } != 0,
         restore_foreground: options.restore_foreground,
+        nonactivating: false,
+        original_dpi: info.dpi,
+        original_monitor: 0,
     };
     if options.restore_foreground || options.focus == FocusState::Unfocused {
         // Grant this process foreground rights before the target takes focus; restoring the
@@ -1345,7 +1693,14 @@ pub fn capture(
         restore.move_back = true;
         // SAFETY: ShowWindow takes the handle by value and fails softly for invalid windows.
         unsafe {
-            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(
+                hwnd,
+                if options.client_size.is_some() {
+                    SW_SHOWNORMAL
+                } else {
+                    SW_RESTORE
+                },
+            );
         }
         wait(Duration::from_millis(60), cancelled)?;
         let current = window_rect(hwnd)?;
@@ -1370,12 +1725,26 @@ pub fn capture(
         );
         workspace = Some(monitor.work);
     }
-    // SAFETY: IsIconic takes the handle by value.
-    if unsafe { IsIconic(hwnd) } != 0 {
+    // SAFETY: both state checks take the handle by value.
+    if unsafe { IsIconic(hwnd) != 0 || (options.client_size.is_some() && IsZoomed(hwnd) != 0) } {
+        restore.move_back = true;
         // SAFETY: ShowWindow takes the handle by value and fails softly.
         unsafe {
-            ShowWindow(hwnd, SW_RESTORE);
+            ShowWindow(
+                hwnd,
+                if options.client_size.is_some() {
+                    SW_SHOWNORMAL
+                } else {
+                    SW_RESTORE
+                },
+            );
         }
+        flush();
+        wait(Duration::from_millis(60), cancelled)?;
+    }
+    if let Some(requested) = options.client_size {
+        restore.move_back = true;
+        resize_client(hwnd, requested, cancelled)?;
     }
     // Activate only a background target; activating an active menu owner can cancel menu
     // tracking.
@@ -1428,6 +1797,9 @@ pub fn capture(
             capture_bounds = fit_workspace(hwnd, work, options, cancelled)?;
         }
     }
+    if let Some(requested) = options.client_size {
+        require_client_size(hwnd, requested)?;
+    }
     let target = extended(hwnd)?;
     let mut foreground = vec![target];
     for &(menu, rect) in &menus {
@@ -1461,24 +1833,17 @@ pub fn capture(
     );
     // SAFETY: GetDpiForWindow takes the handle by value and returns 0 for invalid windows.
     info.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let shadow_policy = validate_no_shadow(hwnd, options)?;
     let cursor = if options.include_cursor {
         cursor()?
     } else {
         None
     };
-    let mut shadow_enabled = 0_i32;
-    // SAFETY: SPI_GETCURSORSHADOW writes a BOOL to the live i32 `shadow_enabled`.
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETCURSORSHADOW,
-            0,
-            (&mut shadow_enabled as *mut i32).cast(),
-            0,
-        );
-    }
-    let shadow = options.cursor_shadow == CursorShadow::On
-        || (options.cursor_shadow == CursorShadow::Auto && shadow_enabled != 0);
-    let opaque_regions = opaque_regions(hwnd, target, capture_bounds)?;
+    let opaque_regions = if options.no_shadow {
+        Vec::new()
+    } else {
+        opaque_regions(hwnd, target, capture_bounds)?
+    };
     let mut images = Vec::with_capacity(2);
     for (overlay, white_pass) in [(&white, true), (&black, false)] {
         if white_pass {
@@ -1490,6 +1855,9 @@ pub fn capture(
             extended(hwnd)? == target && open_menus(hwnd)? == menus,
             "Target or its open menus moved, resized, opened or closed; retry with a stationary window and menu"
         );
+        if let Some(requested) = options.client_size {
+            require_client_size(hwnd, requested)?;
+        }
         overlay.place(hwnd, capture_bounds)?;
         let started = Instant::now();
         let settled = started + Duration::from_millis(options.settle_ms);
@@ -1526,12 +1894,36 @@ pub fn capture(
             extended(hwnd)? == target && open_menus(hwnd)? == menus,
             "Target or its open menus changed while capturing; retry with a stationary window and menu"
         );
+        if let Some(requested) = options.client_size {
+            require_client_size(hwnd, requested)?;
+        }
         overlay.hide();
         flush();
         images.push(image);
     }
     let black = images.pop().context("Missing black composite")?;
     let white = images.pop().context("Missing white composite")?;
+    ensure!(
+        validate_no_shadow(hwnd, options)? == shadow_policy,
+        "Target shadow or composition policy changed while capturing; retry with a stationary window"
+    );
+    let layers = cursor_layers(cursor, capture_bounds, options.cursor_shadow);
+    Ok(Composites {
+        blend_space: shadow_policy.blend_space,
+        corner_radius: shadow_policy.corner_radius,
+        white,
+        black,
+        window: info,
+        opaque_regions,
+        cursor: layers,
+    })
+}
+
+fn cursor_layers(
+    cursor: Option<Cursor>,
+    capture_bounds: Rect,
+    policy: CursorShadow,
+) -> Vec<crate::alpha::Overlay> {
     let mut layers = Vec::new();
     if let Some(cursor) = cursor
         && cursor.point.x >= capture_bounds.left
@@ -1541,7 +1933,17 @@ pub fn capture(
     {
         let x = cursor.point.x - cursor.hotspot.0 - capture_bounds.left;
         let y = cursor.point.y - cursor.hotspot.1 - capture_bounds.top;
-        if shadow {
+        let mut shadow_enabled = 0_i32;
+        // SAFETY: SPI_GETCURSORSHADOW writes a BOOL to the live i32 output value.
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETCURSORSHADOW,
+                0,
+                (&mut shadow_enabled as *mut i32).cast(),
+                0,
+            );
+        }
+        if policy == CursorShadow::On || (policy == CursorShadow::Auto && shadow_enabled != 0) {
             layers.push(crate::alpha::Overlay {
                 image: cursor_shadow(&cursor.image),
                 x: x - 3,
@@ -1554,19 +1956,516 @@ pub fn capture(
             y,
         });
     }
-    Ok(Composites {
-        white,
-        black,
-        window: info,
-        opaque_regions,
-        cursor: layers,
+    layers
+}
+
+fn wgc_monitor_move(current: usize, dpi: u32, desired: &MonitorInfo, named: bool) -> bool {
+    current != desired.handle && (named || dpi < desired.dpi)
+}
+
+fn scaled_wgc_rect(work: Rect, original: Rect, from_dpi: u32, to_dpi: u32) -> Result<Rect> {
+    ensure!(
+        from_dpi > 0 && to_dpi > 0,
+        "Cannot scale a window with unknown DPI"
+    );
+    let ratio = f64::from(to_dpi) / f64::from(from_dpi);
+    let width = (f64::from(original.width()) * ratio).round_ties_even();
+    let height = (f64::from(original.height()) * ratio).round_ties_even();
+    ensure!(
+        width > 0.0
+            && height > 0.0
+            && width <= f64::from(i32::MAX)
+            && height <= f64::from(i32::MAX),
+        "Scaled window dimensions are invalid"
+    );
+    Ok(centered(work, width as i32, height as i32))
+}
+
+/// Arms nonactivating restoration before the first geometry mutation; no guard for the fast path.
+fn prepare_wgc_geometry(
+    hwnd: HWND,
+    window: &WindowInfo,
+    options: &CaptureOptions,
+    cancelled: &AtomicBool,
+) -> Result<Option<Restore>> {
+    let resize = if let Some(requested) = options.client_size {
+        let client = client_rect(hwnd)?;
+        (client.width(), client.height()) != (requested.0 as i32, requested.1 as i32)
+    } else {
+        false
+    };
+    if !options.high_dpi && !resize {
+        return Ok(None);
+    }
+    let monitors = list_monitors()?;
+    // SAFETY: MonitorFromWindow only reads the current monitor association.
+    let current_handle = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) } as usize;
+    let current = monitors
+        .iter()
+        .find(|m| m.handle == current_handle)
+        .context("Target monitor is no longer active")?;
+    let desired = if options.high_dpi {
+        high_dpi_display(&monitors, options.high_dpi_display.as_deref())?
+    } else {
+        current
+    };
+    let relocate = options.high_dpi
+        && wgc_monitor_move(
+            current_handle,
+            window.dpi,
+            desired,
+            options.high_dpi_display.is_some(),
+        );
+    if options.high_dpi && !relocate {
+        ensure!(
+            window.dpi == current.dpi && window.dpi >= desired.dpi,
+            "The application reports {} DPI on a {}-DPI display; high-DPI capture requires a per-monitor DPI-aware application",
+            window.dpi,
+            current.dpi
+        );
+    }
+    if !relocate && !resize {
+        eprintln!(
+            "Capturing on {} ({}) at {} DPI",
+            current.name,
+            current.description.escape_debug(),
+            current.dpi
+        );
+        return Ok(None);
+    }
+    ensure!(
+        open_menus(hwnd)?.is_empty(),
+        "Close the open menu before WGC moves or resizes its owner"
+    );
+    // SAFETY: zero is valid for WINDOWPLACEMENT; Win32 fills the initialized output below.
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..unsafe { zeroed() }
+    };
+    // SAFETY: placement is a live output with the required length initialized.
+    unsafe {
+        check(
+            GetWindowPlacement(hwnd, &mut placement),
+            "Get target placement",
+        )?;
+        ensure!(
+            placement.showCmd == SW_SHOWNORMAL as u32
+                && IsZoomed(hwnd) == 0
+                && IsWindowArranged(hwnd) == 0,
+            "WGC cannot temporarily move or resize a maximized or snapped window without changing its state; restore the window first"
+        );
+    }
+    let destination = if relocate {
+        Some(scaled_wgc_rect(
+            desired.work,
+            window.rect,
+            window.dpi,
+            desired.dpi,
+        )?)
+    } else {
+        None
+    };
+    ensure!(!cancelled.load(Ordering::Relaxed), "Capture cancelled");
+    let restore = Restore {
+        target: hwnd,
+        foreground: null_mut(),
+        placement,
+        original: window.rect,
+        move_back: true,
+        restore_foreground: false,
+        nonactivating: true,
+        original_dpi: window.dpi,
+        original_monitor: current_handle,
+    };
+    if let Some(destination) = destination {
+        move_window(hwnd, destination)?;
+        flush();
+        wait(Duration::from_millis(150), cancelled)?;
+        // SAFETY: these are read-only queries of the target after its DPI transition.
+        let (actual_dpi, actual_monitor) = unsafe {
+            (
+                GetDpiForWindow(hwnd),
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) as usize,
+            )
+        };
+        ensure!(
+            actual_dpi == desired.dpi && actual_monitor == desired.handle,
+            "The application reports {actual_dpi} DPI after moving to {} at {} DPI; high-DPI capture requires a per-monitor DPI-aware application",
+            desired.name,
+            desired.dpi
+        );
+    }
+    if let Some(requested) = options.client_size {
+        resize_client(hwnd, requested, cancelled)?;
+    }
+    if relocate {
+        let work = desired.work;
+        let frame = fit_workspace(hwnd, work, options, cancelled)?;
+        let center = centered(work, frame.width(), frame.height());
+        let outer = window_rect(hwnd)?;
+        let (dx, dy) = (center.left - frame.left, center.top - frame.top);
+        if dx != 0 || dy != 0 {
+            move_window(
+                hwnd,
+                Rect {
+                    left: outer.left + dx,
+                    top: outer.top + dy,
+                    right: outer.right + dx,
+                    bottom: outer.bottom + dy,
+                },
+            )?;
+            flush();
+            wait(Duration::from_millis(100), cancelled)?;
+        }
+        ensure!(
+            work.contains(extended(hwnd)?),
+            "The application would not fit within the WGC monitor workspace"
+        );
+    }
+    if let Some(requested) = options.client_size {
+        require_client_size(hwnd, requested)?;
+    }
+    if options.high_dpi {
+        // SAFETY: the target was remeasured after every geometry adjustment.
+        let actual = unsafe {
+            (
+                GetDpiForWindow(hwnd),
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) as usize,
+            )
+        };
+        ensure!(
+            actual
+                == (
+                    desired.dpi,
+                    if relocate {
+                        desired.handle
+                    } else {
+                        current_handle
+                    }
+                ),
+            "The application changed its capture monitor or DPI while resizing"
+        );
+        let monitor = if relocate { desired } else { current };
+        eprintln!(
+            "Capturing on {} ({}) at {} DPI",
+            monitor.name,
+            monitor.description.escape_debug(),
+            monitor.dpi
+        );
+    }
+    Ok(Some(restore))
+}
+
+/// Captures native straight RGBA, keeping ordinary WGC stationary and nonactivating.
+/// Reuse `source` on its creating thread for repeated captures. Focus options apply to backdrop
+/// capture; WGC keeps the current appearance. Padding adds transparent pixels, not a backdrop.
+///
+/// # Errors
+///
+/// Fails for unavailable/protected targets, geometry changes, incompatible current DPI/client
+/// dimensions, unsupported shadow removal, cancellation, and bounded WGC frame/readback errors.
+pub fn capture_wgc(
+    source: &snapshot::Snapshotter,
+    handle: usize,
+    options: &CaptureOptions,
+    cancelled: &AtomicBool,
+) -> Result<CapturedImage> {
+    enable_per_monitor_dpi();
+    ensure!(
+        options.backend == CaptureBackend::Wgc,
+        "capture_wgc requires the WGC backend"
+    );
+    ensure!(!cancelled.load(Ordering::Relaxed), "Capture cancelled");
+    ensure!(
+        options.high_dpi_display.is_none() || options.high_dpi,
+        "A high-DPI monitor requires high_dpi to be enabled"
+    );
+    ensure!(options.pad <= 4096, "Padding is too large");
+    ensure!(
+        options.client_size.is_none_or(|(width, height)| width > 0
+            && height > 0
+            && u64::from(width) * u64::from(height) <= 40_000_000),
+        "Client size must have positive dimensions and at most 40 million pixels"
+    );
+    let hwnd = handle as HWND;
+    let window = window_info(handle)?;
+    ensure!(
+        // SAFETY: these predicates accept an HWND by value and read window state only.
+        unsafe { IsWindowVisible(hwnd) } != 0 && unsafe { IsIconic(hwnd) } == 0 && !cloaked(hwnd),
+        "WGC target must be visible, not minimized, and on the current desktop"
+    );
+    ensure!(top_level(hwnd) == hwnd, "WGC requires a top-level window");
+    validate_no_shadow(hwnd, options)?;
+    let mut restore = prepare_wgc_geometry(hwnd, &window, options, cancelled)?;
+    let window = if restore.is_some() {
+        window_info(handle)?
+    } else {
+        window
+    };
+    let shadow_policy = validate_no_shadow(hwnd, options)?;
+    let bounds = extended(hwnd)?;
+    ensure!(
+        bounds.width() > 0 && bounds.height() > 0,
+        "WGC target frame is empty"
+    );
+    let cursor = if options.include_cursor {
+        cursor()?
+    } else {
+        None
+    };
+    let mut image = source.capture(handle, || cancelled.load(Ordering::Relaxed))?;
+    ensure!(
+        window_rect(hwnd)? == window.rect && extended(hwnd)? == bounds,
+        "Target moved or resized during WGC capture; retry with a stationary window"
+    );
+    ensure!(
+        image.dimensions() == (bounds.width() as u32, bounds.height() as u32),
+        "WGC surface size does not match the target's frame bounds; this window geometry is unsupported"
+    );
+    ensure!(
+        validate_no_shadow(hwnd, options)? == shadow_policy,
+        "Target shadow policy changed during WGC capture; retry with a stationary window"
+    );
+    if shadow_policy.corner_radius > 0.0 {
+        image = crate::alpha::finish(
+            image,
+            &crate::alpha::AlphaOptions {
+                crop: false,
+                corner_radius: shadow_policy.corner_radius,
+                ..Default::default()
+            },
+        )?
+        .image;
+    }
+    let pad = if options.no_shadow { 0 } else { options.pad };
+    if pad > 0 {
+        let width = image.width() + 2 * pad;
+        let height = image.height() + 2 * pad;
+        ensure!(
+            u64::from(width) * u64::from(height) <= 40_000_000,
+            "Padded WGC canvas exceeds 40 million pixels"
+        );
+        let mut padded = RgbaImage::new(width, height);
+        image::imageops::replace(&mut padded, &image, i64::from(pad), i64::from(pad));
+        image = padded;
+    }
+    let cursor = cursor_layers(
+        cursor,
+        bounds.inflate(pad as i32, pad as i32, pad as i32, pad as i32),
+        options.cursor_shadow,
+    );
+    if let Some(restore) = &mut restore {
+        restore.geometry()?;
+    }
+    Ok(CapturedImage {
+        image,
+        window,
+        cursor,
     })
 }
+
+#[cfg(test)]
+#[path = "shadow_tests.rs"]
+mod shadow_tests;
+
+#[cfg(test)]
+#[path = "wgc_geometry_tests.rs"]
+mod wgc_geometry_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgb;
+
+    #[test]
+    fn wgc_geometry_plans_only_needed_monitor_moves_and_scales_physical_pixels() {
+        let work = Rect {
+            left: 2000,
+            top: 0,
+            right: 5840,
+            bottom: 2160,
+        };
+        let desired = MonitorInfo {
+            handle: 2,
+            name: "Virtual".into(),
+            description: String::new(),
+            rect: work,
+            work,
+            dpi: 192,
+        };
+        assert!(wgc_monitor_move(1, 96, &desired, false));
+        assert!(!wgc_monitor_move(1, 192, &desired, false));
+        assert!(!wgc_monitor_move(1, 288, &desired, false));
+        assert!(wgc_monitor_move(1, 192, &desired, true));
+        assert!(!wgc_monitor_move(2, 192, &desired, true));
+        assert!(!wgc_monitor_move(2, 96, &desired, false));
+        let original = Rect {
+            left: 10,
+            top: 10,
+            right: 810,
+            bottom: 610,
+        };
+        let scaled = scaled_wgc_rect(work, original, 96, 192).unwrap();
+        assert_eq!((scaled.width(), scaled.height()), (1600, 1200));
+        assert_eq!((scaled.left, scaled.top), (3120, 480));
+        let fit = scaled_wgc_rect(work, original, 96, 480).unwrap();
+        assert_eq!((fit.width(), fit.height()), (2880, 2160));
+        assert!(work.contains(fit));
+        assert!(scaled_wgc_rect(work, original, 0, 192).is_err());
+        assert!(scaled_wgc_rect(work, original, 96, 0).is_err());
+    }
+
+    #[test]
+    fn native_corner_selection_covers_policy_dpi_and_square_states() {
+        for dpi in [96, 120, 144, 192] {
+            for (preference, radius) in [
+                (DWMWCP_DEFAULT, 8.0),
+                (DWMWCP_ROUND, 8.0),
+                (DWMWCP_ROUNDSMALL, 4.0),
+                (DWMWCP_DONOTROUND, 0.0),
+            ] {
+                assert_eq!(
+                    standard_corner_radius(Some(preference), 26200, dpi, false).unwrap(),
+                    radius * dpi as f32 / 96.0
+                );
+                assert_eq!(
+                    standard_corner_radius(Some(preference), 26200, dpi, true).unwrap(),
+                    0.0
+                );
+                assert_eq!(
+                    standard_corner_radius(Some(preference), 19045, dpi, false).unwrap(),
+                    0.0
+                );
+            }
+        }
+        assert_eq!(standard_corner_radius(None, 19045, 96, false).unwrap(), 0.0);
+        for (preference, build, dpi) in [
+            (None, 26200, 96),
+            (Some(99), 26200, 96),
+            (Some(DWMWCP_DEFAULT), 0, 96),
+            (Some(DWMWCP_DEFAULT), 26200, 0),
+        ] {
+            assert!(standard_corner_radius(preference, build, dpi, false).is_err());
+        }
+    }
+
+    #[test]
+    fn native_frame_gate_excludes_full_client_custom_chrome_and_missing_style_flags() {
+        let frame = Rect {
+            left: 0,
+            top: 0,
+            right: 320,
+            bottom: 220,
+        };
+        let client = Rect {
+            left: 1,
+            top: 23,
+            right: 319,
+            bottom: 219,
+        };
+        assert!(native_frame(WS_OVERLAPPEDWINDOW, frame, client, 23));
+        assert!(native_frame(
+            WS_OVERLAPPEDWINDOW & !WS_THICKFRAME,
+            frame,
+            client,
+            23
+        ));
+        assert!(!native_frame(WS_OVERLAPPEDWINDOW, frame, frame, 23));
+        for style in [
+            WS_POPUP | WS_THICKFRAME,
+            WS_OVERLAPPEDWINDOW & !WS_DLGFRAME,
+            WS_OVERLAPPEDWINDOW | WS_CHILD,
+        ] {
+            assert!(!native_frame(style, frame, client, 23));
+        }
+        assert!(!native_frame(WS_OVERLAPPEDWINDOW, frame, client, 0));
+    }
+    #[test]
+    fn backdrop_entrypoint_never_falls_back_for_wgc_options() {
+        let error = capture(
+            0,
+            &CaptureOptions {
+                backend: CaptureBackend::Wgc,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("use capture_wgc"));
+    }
+
+    #[test]
+    fn backdrop_policy_matches_measured_sdr_shadow() {
+        let policy = validate_no_shadow(null_mut(), &CaptureOptions::default()).unwrap();
+        let image = crate::alpha::recover(
+            &RgbImage::from_pixel(1, 1, image::Rgb([199; 3])),
+            &RgbImage::new(1, 1),
+            &crate::alpha::AlphaOptions {
+                blend_space: policy.blend_space,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .image;
+        assert_eq!(image[(0, 0)].0, [0, 0, 0, 56]);
+    }
+
+    #[test]
+    fn no_shadow_maximized_support_accounts_for_backend_and_window_normalization() {
+        let mut options = CaptureOptions {
+            no_shadow: true,
+            ..Default::default()
+        };
+        assert!(!shadow_free_maximized(false, &options));
+        assert!(shadow_free_maximized(true, &options));
+        options.client_size = Some((800, 600));
+        assert!(!shadow_free_maximized(true, &options));
+        options.client_size = None;
+        options.high_dpi = true;
+        assert!(!shadow_free_maximized(true, &options));
+        options.backend = CaptureBackend::Wgc;
+        assert!(shadow_free_maximized(true, &options));
+        options.client_size = Some((800, 600));
+        assert!(shadow_free_maximized(true, &options));
+        assert!(!shadow_free_maximized(false, &options));
+        assert_eq!(
+            validate_no_shadow(null_mut(), &CaptureOptions::default()).unwrap(),
+            ShadowPolicy::default()
+        );
+    }
+
+    #[test]
+    fn client_size_validation_rejects_invalid_dimensions_before_accessing_the_target() {
+        assert_eq!(CaptureOptions::default().client_size, None);
+        for requested in [(0, 1), (1, 0), (8000, 5001), (u32::MAX, 1), (1, u32::MAX)] {
+            let error = capture(
+                0,
+                &CaptureOptions {
+                    client_size: Some(requested),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("Client size"), "{error}");
+        }
+        let error = capture(
+            0,
+            &CaptureOptions {
+                client_size: Some((40_000_000, 1)),
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("Invalid window handle"),
+            "{error}"
+        );
+    }
 
     #[test]
     #[ignore = "Needs ALPHASHOT_TEST_RESTRICTED_HWND: an existing elevated window; only places an off-screen test backdrop"]

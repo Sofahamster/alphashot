@@ -290,6 +290,20 @@ impl View {
         args: &Cli,
         mouse: MouseEvent,
     ) -> Option<KeyCode> {
+        if self.modal
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            let key = if mouse.kind == MouseEventKind::ScrollUp {
+                KeyCode::Up
+            } else {
+                KeyCode::Down
+            };
+            picker.editor.as_mut()?.key(key.into());
+            return None;
+        }
         if self.modal && mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return None;
         }
@@ -646,7 +660,7 @@ fn editor_area(columns: u16, rows: u16) -> Area {
 fn draw_editor(
     out: &mut Frame,
     view: &mut View,
-    editor: &Editor,
+    editor: &mut Editor,
     columns: u16,
     rows: u16,
 ) -> Result<()> {
@@ -654,10 +668,28 @@ fn draw_editor(
     let (width, height) = (area.w, area.h);
     let first = area.y + if height >= 16 { 3 } else { 1 };
     let buttons = area.y + height - 3;
+    let visible = usize::from(buttons - first).min(Field::ALL.len());
+    editor.offset = editor
+        .offset
+        .min(Field::ALL.len() - visible)
+        .min(editor.selected as usize);
+    if editor.selected as usize >= editor.offset + visible {
+        editor.offset = editor.selected as usize + 1 - visible;
+    }
+    let position = if visible < Field::ALL.len() {
+        format!(
+            "{}–{} / {}",
+            editor.offset + 1,
+            editor.offset + visible,
+            Field::ALL.len()
+        )
+    } else {
+        String::new()
+    };
     view.modal = true;
     view.buttons.clear();
     view.fields.clear();
-    panel(out, area, "capture settings", "", GOLD)?;
+    panel(out, area, "capture settings", &position, GOLD)?;
     if height >= 16 {
         text(
             out,
@@ -669,7 +701,12 @@ fn draw_editor(
         )?;
     }
     let monochrome = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-    for (row, field) in Field::ALL.iter().enumerate() {
+    for (row, field) in Field::ALL
+        .iter()
+        .skip(editor.offset)
+        .take(visible)
+        .enumerate()
+    {
         let y = first + row as u16;
         let active = *field == editor.selected;
         let mut row_style = style(TEXT).on(if active { SELECTED } else { PANEL });
@@ -736,11 +773,11 @@ fn draw_editor(
             1,
         ));
     }
-    let help = (first + 6).min(buttons - 1);
+    let help = first + visible as u16 + u16::from(height >= 16);
     for (row, line) in wrapped(
         &editor.description(),
         usize::from(width - 6),
-        usize::from((buttons - help).min(5)),
+        usize::from(buttons.saturating_sub(help).min(5)),
     )
     .iter()
     .enumerate()
@@ -789,8 +826,16 @@ fn draw_editor(
         area.x + 3,
         area.y + height - 2,
         width - 6,
-        "↑↓ / Tab select  ←→ / Space change  F5 refresh",
-        style(MUTED),
+        editor
+            .message
+            .as_deref()
+            .filter(|_| help >= buttons)
+            .unwrap_or("↑↓ / Tab select  ←→ / Space change  F5 refresh"),
+        style(if editor.message.is_some() && help >= buttons {
+            GOLD
+        } else {
+            MUTED
+        }),
     )?;
     Ok(())
 }
@@ -824,6 +869,8 @@ pub(super) fn draw(
     let body_y = area.y + if compact { 5 } else { 7 };
     let body_h = height - if compact { 8 } else { 10 };
     let sidebar = width >= 108 && body_h >= 14;
+    let settings_height = Field::ALL.len() as u16 + 2;
+    let show_settings = sidebar && body_h >= settings_height + 19;
     let stacked = !sidebar && body_h >= 12;
     let windows = Area {
         x: area.x,
@@ -1066,8 +1113,8 @@ pub(super) fn draw(
                 x: area.x + width - 32,
                 y: body_y,
                 w: 32,
-                h: if body_h >= 26 {
-                    body_h - 17
+                h: if show_settings {
+                    body_h - settings_height - 10
                 } else {
                     body_h - 7
                 },
@@ -1158,13 +1205,12 @@ pub(super) fn draw(
             }
         }
         if sidebar {
-            let show_settings = body_h >= 26;
             if show_settings {
                 let settings = Area {
                     x: details.x,
                     y: details.y + details.h + 1,
                     w: 32,
-                    h: 7,
+                    h: settings_height,
                 };
                 panel(&mut out, settings, "capture settings", "F4 edit", GOLD)?;
                 for (row, field) in Field::ALL.iter().enumerate() {
@@ -1174,7 +1220,7 @@ pub(super) fn draw(
                         &mut out,
                         settings.x + 9,
                         y,
-                        18,
+                        19,
                         &field.value(args),
                         style(TEXT),
                     )?;
@@ -1349,7 +1395,7 @@ pub(super) fn draw(
             )?;
         }
     }
-    if let Some(editor) = &picker.editor {
+    if let Some(editor) = &mut picker.editor {
         draw_editor(&mut out, &mut view, editor, columns, rows)?;
     } else {
         out.cursor = Some((search.x + 4 + span(&query) as u16, search.y + 1));
@@ -1771,6 +1817,33 @@ mod tests {
             for &(area, _) in &view.buttons {
                 assert!(area.x + area.w <= columns && area.y + area.h <= rows);
             }
+            let modal = editor_area(columns, rows);
+            let first = if modal.h >= 16 { 3 } else { 1 };
+            let visible = usize::from(modal.h - 3 - first).min(Field::ALL.len());
+            assert_eq!(view.fields.len(), visible * 3);
+            let frame = picker.frame.as_ref().unwrap();
+            for field in Field::ALL.into_iter().take(visible) {
+                let (area, _, _) = view
+                    .fields
+                    .iter()
+                    .find(|(_, f, step)| *f == field && *step == 0)
+                    .unwrap();
+                assert!(
+                    view.buttons
+                        .iter()
+                        .all(|(button, _)| !button.intersects(*area))
+                );
+                let start = usize::from(area.y) * usize::from(columns);
+                let row: String = frame.cells[start..start + usize::from(columns)]
+                    .iter()
+                    .map(|cell| cell.0)
+                    .collect();
+                assert!(
+                    row.contains(field.label()),
+                    "Hidden settings row: {} at {columns}x{rows}",
+                    field.label()
+                );
+            }
             assert_eq!(view.mouse(&mut picker, &args, click(0, 0)), None);
             assert_eq!(picker.selected, 1);
             let (cursor, _, _) = view
@@ -1819,6 +1892,221 @@ mod tests {
             assert!(args.include_cursor && picker.editor.is_none());
             assert_eq!(picker.selected, 1);
         }
+    }
+
+    #[test]
+    fn all_settings_scroll_into_view_and_mouse_changes_apply_or_cancel() {
+        use alphashot::capture::CaptureBackend;
+        for (columns, rows) in [(60, 12), (60, 13), (80, 24), (128, 48), (200, 80)] {
+            let mut args = Cli::parse_from(["alphashot"]);
+            let mut picker = demo();
+            picker.key(KeyCode::F(4).into(), 10, &mut args).unwrap();
+            let click = |column, row| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            let wheel = |kind| MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            for field in Field::ALL {
+                assert_eq!(picker.editor.as_ref().unwrap().selected, field);
+                let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+                let (area, _, _) = view
+                    .fields
+                    .iter()
+                    .find(|(_, item, step)| *item == field && *step == 0)
+                    .unwrap();
+                let frame = picker.frame.as_ref().unwrap();
+                let start = usize::from(area.y) * usize::from(columns);
+                let text: String = frame.cells[start..start + usize::from(columns)]
+                    .iter()
+                    .map(|cell| cell.0)
+                    .collect();
+                assert!(
+                    text.contains(field.label()),
+                    "Hidden row {} at {columns}x{rows}",
+                    field.label()
+                );
+                for (area, _, _) in &view.fields {
+                    assert!(area.x + area.w <= columns && area.y + area.h <= rows);
+                    assert!(
+                        view.buttons
+                            .iter()
+                            .all(|(button, _)| !button.intersects(*area))
+                    );
+                }
+                let offset = picker.editor.as_ref().unwrap().offset;
+                view.mouse(&mut picker, &args, click(area.x, area.y));
+                draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+                assert_eq!(
+                    picker.editor.as_ref().unwrap().offset,
+                    offset,
+                    "Click moved the visible row"
+                );
+                picker
+                    .key(KeyCode::Down.into(), view.visible, &mut args)
+                    .unwrap();
+            }
+            assert_eq!(picker.editor.as_ref().unwrap().selected, Field::Format);
+            for _ in 1..Field::ALL.len() {
+                let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+                view.mouse(&mut picker, &args, wheel(MouseEventKind::ScrollDown));
+            }
+            assert_eq!(picker.editor.as_ref().unwrap().selected, Field::TiffAlpha);
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            view.mouse(&mut picker, &args, wheel(MouseEventKind::ScrollUp));
+            assert_eq!(picker.editor.as_ref().unwrap().selected, Field::Shadow);
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (shadow, _, _) = view
+                .fields
+                .iter()
+                .find(|(_, field, step)| *field == Field::Shadow && *step == 1)
+                .unwrap();
+            view.mouse(&mut picker, &args, click(shadow.x, shadow.y));
+            assert!(picker.editor.as_ref().unwrap().draft.no_shadow);
+            assert!(!args.no_shadow);
+            view.mouse(&mut picker, &args, wheel(MouseEventKind::ScrollUp));
+            assert_eq!(picker.editor.as_ref().unwrap().selected, Field::Backend);
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (backend, _, _) = view
+                .fields
+                .iter()
+                .find(|(_, field, step)| *field == Field::Backend && *step == 1)
+                .unwrap();
+            view.mouse(&mut picker, &args, click(backend.x, backend.y));
+            assert_eq!(
+                picker.editor.as_ref().unwrap().draft.backend,
+                CaptureBackend::Wgc
+            );
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (apply, _) = view
+                .buttons
+                .iter()
+                .find(|(_, key)| *key == KeyCode::Enter)
+                .unwrap();
+            let key = view
+                .mouse(&mut picker, &args, click(apply.x, apply.y))
+                .unwrap();
+            picker.key(key.into(), view.visible, &mut args).unwrap();
+            assert!(args.no_shadow && args.backend == CaptureBackend::Wgc);
+            assert_eq!(picker.selected, 1);
+            picker
+                .key(KeyCode::F(4).into(), view.visible, &mut args)
+                .unwrap();
+            picker.editor.as_mut().unwrap().change(Field::Backend, 1);
+            picker.editor.as_mut().unwrap().change(Field::Shadow, 1);
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (cancel, _) = view
+                .buttons
+                .iter()
+                .find(|(_, key)| *key == KeyCode::Esc)
+                .unwrap();
+            let key = view
+                .mouse(&mut picker, &args, click(cancel.x, cancel.y))
+                .unwrap();
+            picker.key(key.into(), view.visible, &mut args).unwrap();
+            assert!(args.no_shadow && args.backend == CaptureBackend::Wgc);
+        }
+    }
+
+    #[test]
+    fn preset_mouse_targets_select_apply_cancel_and_show_compact_errors() {
+        use clap::CommandFactory;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("presets.ini");
+        std::fs::write(&path, "[work]\nmargin=9\ninclude-cursor=true\n").unwrap();
+        for (columns, rows) in [(60, 12), (80, 24), (110, 26), (128, 48), (200, 80)] {
+            let matches = Cli::command().get_matches_from(["alphashot", "--include-cursor=false"]);
+            let mut args = Cli::with_sources(&matches).unwrap();
+            args.presets_file = Some(path.clone());
+            let mut picker = demo();
+            picker.key(KeyCode::F(4).into(), 10, &mut args).unwrap();
+            let click = |column, row| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (preset, _, _) = view
+                .fields
+                .iter()
+                .find(|(_, field, step)| *field == Field::Preset && *step == 1)
+                .unwrap();
+            view.mouse(&mut picker, &args, click(preset.x, preset.y));
+            assert_eq!(
+                picker.editor.as_ref().unwrap().draft.preset.as_deref(),
+                Some("work")
+            );
+            assert!(args.preset.is_none());
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (cancel, _) = view
+                .buttons
+                .iter()
+                .find(|(_, key)| *key == KeyCode::Esc)
+                .unwrap();
+            let key = view
+                .mouse(&mut picker, &args, click(cancel.x, cancel.y))
+                .unwrap();
+            picker.key(key.into(), view.visible, &mut args).unwrap();
+            assert!(args.preset.is_none() && args.alpha.margin == 0);
+
+            picker.key(KeyCode::F(4).into(), 10, &mut args).unwrap();
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            view.mouse(&mut picker, &args, click(preset.x, preset.y));
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            let (apply, _) = view
+                .buttons
+                .iter()
+                .find(|(_, key)| *key == KeyCode::Enter)
+                .unwrap();
+            let key = view
+                .mouse(&mut picker, &args, click(apply.x, apply.y))
+                .unwrap();
+            picker.key(key.into(), view.visible, &mut args).unwrap();
+            assert_eq!(args.preset.as_deref(), Some("work"));
+            assert_eq!(args.alpha.margin, 9);
+            assert!(!args.include_cursor);
+            assert_eq!(picker.selected, 1);
+
+            let view = draw(&mut picker, &args, &mut Vec::new(), columns, rows).unwrap();
+            assert_eq!(
+                view.fields.len(),
+                if columns >= 128 { Field::ALL.len() } else { 0 }
+            );
+            if columns >= 128 {
+                let (preset, _, _) = view
+                    .fields
+                    .iter()
+                    .find(|(_, field, _)| *field == Field::Preset)
+                    .unwrap();
+                let frame = picker.frame.as_ref().unwrap();
+                let start = usize::from(preset.y) * usize::from(columns);
+                let row: String = frame.cells[start..start + usize::from(columns)]
+                    .iter()
+                    .map(|cell| cell.0)
+                    .collect();
+                assert!(row.contains("Preset") && row.contains("work"));
+                assert!(
+                    view.buttons
+                        .iter()
+                        .all(|(button, _)| !button.intersects(*preset))
+                );
+            }
+        }
+        let args = Cli::parse_from(["alphashot"]);
+        let mut picker = demo();
+        picker.editor = Some(Editor::new(&args, Field::Preset));
+        picker.editor.as_mut().unwrap().message = Some("Preset: Unknown preset key bad".into());
+        draw(&mut picker, &args, &mut Vec::new(), 60, 12).unwrap();
+        let frame = picker.frame.as_ref().unwrap();
+        let text: String = frame.cells.iter().map(|cell| cell.0).collect();
+        assert!(text.contains("Preset: Unknown preset key bad"));
     }
 
     #[test]

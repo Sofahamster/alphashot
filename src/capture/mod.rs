@@ -35,6 +35,11 @@
 //! case-insensitive) must be active and above 96 DPI. Otherwise the highest DPI wins, ties going
 //! to the larger work area. The error lists active displays and links
 //! <https://github.com/Sofahamster/alphashot/blob/main/docs/high-dpi.md>.
+//! The application renders at the monitor's actual DPI; capture does not upscale its pixels.
+//!
+//! [`CaptureOptions::client_size`] temporarily requests exact physical client dimensions after
+//! selecting the capture monitor. The frame and shadow remain outside that area. A constrained
+//! size or a canvas that cannot fit the monitor workspace fails instead of shrinking the client.
 //!
 //! # Cursor shadow
 //!
@@ -44,9 +49,7 @@
 //! layer sits 3 pixels up and left of the cursor, so the black shadow falls 3 pixels right and 1
 //! pixel down.
 use anyhow::{Result, ensure};
-use image::RgbImage;
-#[cfg(any(windows, test))]
-use image::RgbaImage;
+use image::{RgbImage, RgbaImage};
 use std::sync::atomic::AtomicBool;
 
 #[cfg(windows)]
@@ -56,8 +59,8 @@ pub mod snapshot;
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    capture, enable_per_monitor_dpi, list_monitors, list_windows, pick_cursor, pick_overlay,
-    window_info,
+    capture, capture_wgc, enable_per_monitor_dpi, list_monitors, list_windows, pick_cursor,
+    pick_overlay, window_info,
 };
 
 /// Rectangle in physical screen pixels, laid out like Win32 `RECT`; negative left of or above
@@ -129,6 +132,41 @@ pub struct WindowInfo {
     pub dpi: u32,
 }
 
+/// Case-insensitive selectors, combined with AND, for a visible window.
+#[derive(Clone, Debug, Default)]
+pub struct WindowFilter {
+    /// Substring of the window title.
+    pub title: Option<String>,
+    /// Exact executable basename, including its extension.
+    pub process: Option<String>,
+    /// Exact Win32 class name.
+    pub class_name: Option<String>,
+}
+
+impl WindowFilter {
+    /// Whether no selectors were supplied.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.process.is_none() && self.class_name.is_none()
+    }
+
+    /// Whether every supplied selector matches; an unknown process cannot match a name.
+    pub fn matches(&self, window: &WindowInfo) -> bool {
+        self.title
+            .as_ref()
+            .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
+            && self.process.as_ref().is_none_or(|process| {
+                window
+                    .process_name
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase() == process.to_lowercase())
+            })
+            && self
+                .class_name
+                .as_ref()
+                .is_none_or(|class| window.class_name.to_lowercase() == class.to_lowercase())
+    }
+}
+
 /// Active display.
 #[derive(Clone, Debug)]
 pub struct MonitorInfo {
@@ -144,6 +182,16 @@ pub struct MonitorInfo {
     pub work: Rect,
     /// Effective DPI (96 is 100%).
     pub dpi: u32,
+}
+
+/// Source of the captured window pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CaptureBackend {
+    /// Recovers alpha from captures over white and black backdrops.
+    #[default]
+    Backdrop,
+    /// Windows Graphics Capture; keeps the current appearance without activation.
+    Wgc,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -180,7 +228,12 @@ pub enum CursorShadow {
 /// Parameters for [`capture`].
 #[derive(Debug, Clone)]
 pub struct CaptureOptions {
-    /// Activation state; open menus require [`FocusState::Focused`].
+    /// Source of the captured window pixels.
+    pub backend: CaptureBackend,
+    /// Excludes DWM shadow; standard rounded frames use an approximate feathered corner mask.
+    pub no_shadow: bool,
+    /// Backdrop activation state; open menus require [`FocusState::Focused`]. WGC keeps the
+    /// current appearance without activating the target.
     pub focus: FocusState,
     /// Margin shape around the window.
     pub pad_mode: PadMode,
@@ -196,6 +249,10 @@ pub struct CaptureOptions {
     pub high_dpi: bool,
     /// Device name of the high-DPI display; requires `high_dpi`.
     pub high_dpi_display: Option<String>,
+    /// Exact physical client dimensions on the capture monitor, applied after high-DPI moves.
+    /// Both dimensions must be positive and their product at most 40 million pixels. The frame
+    /// and shadow are additional; no resampling is performed. Fails with an open menu.
+    pub client_size: Option<(u32, u32)>,
     /// Reactivates the previous foreground window afterwards.
     pub restore_foreground: bool,
     /// Adds the cursor as an overlay if its hotspot lies in the captured area.
@@ -207,6 +264,8 @@ pub struct CaptureOptions {
 impl Default for CaptureOptions {
     fn default() -> Self {
         Self {
+            backend: CaptureBackend::Backdrop,
+            no_shadow: false,
             focus: FocusState::Focused,
             pad_mode: PadMode::Shadow,
             pad: 4,
@@ -214,6 +273,7 @@ impl Default for CaptureOptions {
             settle_ms: 250,
             high_dpi: false,
             high_dpi_display: None,
+            client_size: None,
             restore_foreground: true,
             include_cursor: false,
             cursor_shadow: CursorShadow::Auto,
@@ -223,6 +283,10 @@ impl Default for CaptureOptions {
 
 /// Result of [`capture`], ready for [`crate::alpha::recover`].
 pub struct Composites {
+    /// Space in which this source composed the passes; pass it to `AlphaOptions::blend_space`.
+    pub blend_space: crate::alpha::BlendSpace,
+    /// Feathered frame radius in physical pixels; pass it to `AlphaOptions::corner_radius`.
+    pub corner_radius: f32,
     /// Composite over white.
     pub white: RgbImage,
     /// Composite over black, the same size as `white`.
@@ -232,6 +296,16 @@ pub struct Composites {
     /// Client rectangles in composite pixels, excluding rounded frame corners.
     pub opaque_regions: Vec<image::math::Rect>,
     /// Cursor shadow and image layers.
+    pub cursor: Vec<crate::alpha::Overlay>,
+}
+
+/// Native straight-alpha pixels, with cursor layers kept separate until finishing the image.
+pub struct CapturedImage {
+    /// Straight-alpha sRGB pixels supplied by the window and compositor.
+    pub image: RgbaImage,
+    /// Target metadata at capture time.
+    pub window: WindowInfo,
+    /// Cursor shadow and image layers, applied after any window-only shadow processing.
     pub cursor: Vec<crate::alpha::Overlay>,
 }
 
@@ -391,14 +465,14 @@ pub fn window_info(_: usize) -> Result<WindowInfo> {
 pub fn pick_cursor(_: bool) -> Result<usize> {
     anyhow::bail!("Live capture requires Windows")
 }
-/// Lets the user click a window, highlighted with a frame 1 to 32 pixels thick and limited by a
-/// case-insensitive filter.
+/// Lets the user click a window, highlighted with a frame 1 to 32 pixels thick and limited by
+/// the window selectors.
 ///
 /// # Errors
 ///
 /// Always fails on this platform.
 #[cfg(not(windows))]
-pub fn pick_overlay(_: Option<&str>, _: u32, _: &AtomicBool) -> Result<usize> {
+pub fn pick_overlay(_: &WindowFilter, _: u32, _: &AtomicBool) -> Result<usize> {
     anyhow::bail!("Live capture requires Windows")
 }
 /// Captures the window over white and black backdrops.
@@ -414,6 +488,50 @@ pub fn capture(_: usize, _: &CaptureOptions, _: &AtomicBool) -> Result<Composite
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_selectors_match_case_insensitively_and_combine_with_and() {
+        let mut window = WindowInfo {
+            handle: 1,
+            pid: 7,
+            process_name: Some("Éditor.EXE".into()),
+            title: "Shopping list — Éditeur".into(),
+            class_name: "EditorWindow".into(),
+            rect: Rect::default(),
+            dpi: 96,
+        };
+        assert!(WindowFilter::default().is_empty());
+        assert!(WindowFilter::default().matches(&window));
+        let mut filter = WindowFilter {
+            title: Some("LIST — ÉD".into()),
+            process: Some("ÉDITOR.exe".into()),
+            class_name: Some("EDITORWINDOW".into()),
+        };
+        assert!(!filter.is_empty());
+        assert!(filter.matches(&window));
+        for (title, process, class) in [
+            ("missing", "éditor.exe", "editorwindow"),
+            ("list", "éditor", "editorwindow"),
+            ("list", "other-éditor.exe", "editorwindow"),
+            ("list", "éditor.exe", "editor"),
+        ] {
+            assert!(
+                !WindowFilter {
+                    title: Some(title.into()),
+                    process: Some(process.into()),
+                    class_name: Some(class.into()),
+                }
+                .matches(&window)
+            );
+        }
+        window.process_name = None;
+        assert!(!filter.matches(&window));
+        filter.process = None;
+        assert!(filter.matches(&window));
+        window.title.clear();
+        filter.title = None;
+        assert!(filter.matches(&window));
+    }
 
     #[test]
     fn high_dpi_selection_requires_an_active_scaled_display() {

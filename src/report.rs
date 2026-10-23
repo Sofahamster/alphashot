@@ -202,7 +202,7 @@ pub fn saved(
     let format = match format.resolve(path)? {
         OutputFormat::Png => "PNG",
         OutputFormat::Webp => "WebP · lossless",
-        OutputFormat::Tiff => "TIFF · lossless",
+        OutputFormat::Tiff => "TIFF · LZW",
         OutputFormat::Auto => unreachable!(),
     };
     let details = format!(

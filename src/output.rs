@@ -1,11 +1,12 @@
-//! Lossless output of straight-alpha images and default file names.
+//! Output of straight-alpha images and default file names.
 //!
-//! Soft shadow edges require lossless formats without premultiplied alpha. All formats store
-//! 8-bit sRGB with straight alpha:
+//! Images use 8-bit sRGB and straight alpha internally. PNG and WebP keep straight alpha;
+//! TIFF can explicitly associate color with alpha, which quantizes translucent colors:
 //!
 //! - PNG: `sRGB` chunk (perceptual); DPI becomes `pHYs` at `round(dpi / 0.0254)` pixels per metre.
 //! - WebP: lossless VP8L; the encoder stores no DPI.
-//! - TIFF: LZW-compressed RGB plus an `UnassociatedAlpha` extra sample; DPI as inch resolution.
+//! - TIFF: LZW-compressed RGB plus `UnassociatedAlpha` by default, or `AssociatedAlpha` with
+//!   [`TiffAlpha::Premultiplied`]; DPI as inch resolution. Only encoded TIFF samples change.
 //!
 //! [`OutputFormat::Auto`] maps `.png` or no extension to PNG, `.webp` to WebP and `.tif` or
 //! `.tiff` to TIFF, ignoring ASCII case, and rejects other extensions. [`save_composite`] writes
@@ -73,11 +74,38 @@ impl OutputFormat {
     }
 }
 
+/// Alpha association stored in a TIFF file; the input image always remains straight RGBA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum TiffAlpha {
+    /// Stores color independently of alpha (`UnassociatedAlpha`), without quantization.
+    #[default]
+    Straight,
+    /// Multiplies each color by alpha (`AssociatedAlpha`), with 8-bit rounding loss.
+    Premultiplied,
+}
+
+impl TiffAlpha {
+    /// Checks the association against a resolved output format.
+    ///
+    /// # Errors
+    ///
+    /// Premultiplied alpha requires TIFF; PNG and WebP store straight alpha.
+    pub fn validate(self, format: OutputFormat) -> Result<()> {
+        ensure!(
+            self == Self::Straight || matches!(format, OutputFormat::Tiff),
+            "Premultiplied alpha requires TIFF; use --out-format tiff or --tiff-alpha straight"
+        );
+        Ok(())
+    }
+}
+
 /// Parameters for [`save`].
 #[derive(Clone, Debug)]
 pub struct SaveOptions {
     /// Output format.
     pub format: OutputFormat,
+    /// TIFF alpha association; premultiplied samples are supported only by TIFF.
+    pub tiff_alpha: TiffAlpha,
     /// Resolution for PNG and TIFF metadata, usually the capture DPI.
     pub dpi: Option<u32>,
     /// Replaces an existing file.
@@ -88,6 +116,7 @@ impl Default for SaveOptions {
     fn default() -> Self {
         Self {
             format: OutputFormat::Auto,
+            tiff_alpha: TiffAlpha::Straight,
             dpi: None,
             overwrite: false,
         }
@@ -187,10 +216,11 @@ pub fn save_composite(image: &RgbImage, path: &Path, dpi: u32, overwrite: bool) 
 ///
 /// # Errors
 ///
-/// Fails for an unsupported extension, as [`check_destination`] does, and on I/O or encoder
-/// errors. A failure leaves an existing file unchanged.
+/// Fails for an unsupported extension or alpha association, as [`check_destination`] does,
+/// and on I/O or encoder errors. A failure leaves an existing file unchanged.
 pub fn save(image: &RgbaImage, path: &Path, options: &SaveOptions) -> Result<()> {
     let format = options.format.resolve(path)?;
+    options.tiff_alpha.validate(format)?;
     write_atomic(path, options.overwrite, |file| {
         match format {
             OutputFormat::Png => png(
@@ -217,11 +247,23 @@ pub fn save(image: &RgbaImage, path: &Path, options: &SaveOptions) -> Result<()>
                 let mut encoder = TiffEncoder::new(file)?.with_compression(Compression::Lzw);
                 let mut output =
                     encoder.new_image::<colortype::RGB8>(image.width(), image.height())?;
-                output.extra_samples(&[ExtraSamples::UnassociatedAlpha])?;
+                let mut pixels = std::borrow::Cow::Borrowed(image.as_raw().as_slice());
+                let association = if options.tiff_alpha == TiffAlpha::Premultiplied {
+                    for pixel in pixels.to_mut().as_chunks_mut::<4>().0 {
+                        let alpha = u16::from(pixel[3]);
+                        for channel in &mut pixel[..3] {
+                            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+                        }
+                    }
+                    ExtraSamples::AssociatedAlpha
+                } else {
+                    ExtraSamples::UnassociatedAlpha
+                };
+                output.extra_samples(&[association])?;
                 if let Some(dpi) = options.dpi {
                     output.resolution(ResolutionUnit::Inch, Rational { n: dpi, d: 1 });
                 }
-                output.write_data(image.as_raw())?;
+                output.write_data(&pixels)?;
             }
             OutputFormat::Auto => unreachable!(),
         }
@@ -374,6 +416,71 @@ mod tests {
                 },
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn tiff_alpha_tags_and_samples_match_without_mutating_straight_rgba() {
+        use tiff::{
+            decoder::{Decoder, DecodingResult},
+            tags::Tag,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let image = RgbaImage::from_fn(5, 1, |x, _| {
+            Rgba([255, 128, 64, [0, 1, 64, 128, 255][x as usize]])
+        });
+        let original = image.clone();
+        assert_eq!(SaveOptions::default().tiff_alpha, TiffAlpha::Straight);
+        for (mode, tag, expected) in [
+            (TiffAlpha::Straight, 2, image.as_raw().clone()),
+            (
+                TiffAlpha::Premultiplied,
+                1,
+                vec![
+                    0, 0, 0, 0, 1, 1, 0, 1, 64, 32, 16, 64, 128, 64, 32, 128, 255, 128, 64, 255,
+                ],
+            ),
+        ] {
+            let path = directory.path().join(format!("{mode:?}.tif"));
+            save(
+                &image,
+                &path,
+                &SaveOptions {
+                    tiff_alpha: mode,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut decoder = Decoder::new(fs::File::open(path).unwrap()).unwrap();
+            assert_eq!(
+                decoder.get_tag_u16_vec(Tag::ExtraSamples).unwrap(),
+                vec![tag]
+            );
+            let DecodingResult::U8(pixels) = decoder.read_image().unwrap() else {
+                panic!("Expected 8-bit samples")
+            };
+            assert_eq!(pixels, expected);
+            assert_eq!(image, original);
+        }
+    }
+
+    #[test]
+    fn premultiplied_alpha_rejects_non_tiff_without_creating_files_or_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("not-created");
+        let image = RgbaImage::from_pixel(1, 1, Rgba([255, 128, 64, 64]));
+        for extension in ["png", "webp"] {
+            let error = save(
+                &image,
+                &parent.join(format!("image.{extension}")),
+                &SaveOptions {
+                    tiff_alpha: TiffAlpha::Premultiplied,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("requires TIFF"));
+            assert!(!parent.exists());
         }
     }
 

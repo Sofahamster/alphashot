@@ -9,7 +9,7 @@
 //!
 //! `Picker` holds the window list, the query, the ranked indices of matching windows, the selected
 //! row, the scroll offset, and an optional settings `Editor`. While the editor is open it receives
-//! all keys. F5 re-enumerates windows, reapplies the `--window-title` filter, and bumps the preview
+//! all keys. F5 re-enumerates windows, reapplies all window selectors, and bumps the preview
 //! epoch so cached snapshots are discarded. Esc and Ctrl+C cancel with an error. Mouse events are
 //! translated by `draw::View::mouse` into key events or selection changes.
 //!
@@ -154,6 +154,13 @@ impl Picker {
         }
     }
 
+    fn refresh(&mut self, mut windows: Vec<WindowInfo>, filter: &capture::WindowFilter) {
+        windows.retain(|window| filter.matches(window));
+        self.windows = windows;
+        self.preview.epoch += 1;
+        self.refilter();
+    }
+
     /// Recomputes `matches` for the current query and resets selection and scroll to the top.
     /// Ties keep window enumeration order because the sort is stable.
     fn refilter(&mut self) {
@@ -256,18 +263,14 @@ impl Picker {
 
 /// Runs the picker until the user selects a window or cancels.
 ///
-/// `title_filter` is the `--window-title` filter, reapplied on F5. `args` is updated in place
-/// when the user applies settings edits. Thumbnails run unless previews are disabled or output
+/// The window selectors in `args` are reapplied on F5. `args` is updated in place when the user
+/// applies settings edits. Thumbnails run unless previews are disabled or output
 /// is unstyled. Fails when stdin or stderr is not a terminal, when the terminal is smaller than
 /// 60x12, or on cancel.
-pub fn pick(
-    windows: Vec<WindowInfo>,
-    title_filter: Option<&str>,
-    args: &mut crate::Cli,
-) -> Result<Selection> {
+pub fn pick(windows: Vec<WindowInfo>, args: &mut crate::Cli) -> Result<Selection> {
     ensure!(
         io::stdin().is_terminal() && io::stderr().is_terminal(),
-        "Interactive window selection requires a terminal; use --window-title or --window-hwnd"
+        "Interactive window selection requires a terminal; use --window-title, --process, --window-class or --window-hwnd"
     );
     let _terminal = Terminal::enter()?;
     let mut picker = Picker::new(windows);
@@ -303,15 +306,7 @@ pub fn pick(
         };
         if let Some(key) = key {
             if key.code == KeyCode::F(5) && picker.editor.is_none() {
-                picker.preview.epoch += 1;
-                picker.windows = capture::list_windows()?;
-                if let Some(filter) = title_filter {
-                    let filter = filter.to_lowercase();
-                    picker
-                        .windows
-                        .retain(|window| window.title.to_lowercase().contains(&filter));
-                }
-                picker.refilter();
+                picker.refresh(capture::list_windows()?, &args.window_filter());
             } else if let Some(selection) = picker.key(key, view.visible, args)? {
                 return Ok(selection);
             }
@@ -339,6 +334,41 @@ mod tests {
             },
             dpi: 144,
         }
+    }
+
+    #[test]
+    fn refresh_preserves_every_selector_and_the_typed_query() {
+        use clap::Parser;
+        let args = crate::Cli::parse_from([
+            "alphashot",
+            "--window-title",
+            "notes",
+            "--process",
+            "editor.exe",
+            "--window-class",
+            "EditorClass",
+        ]);
+        let mut picker = Picker::new(Vec::new());
+        picker.query = "two".into();
+        let mut windows = vec![
+            window(1, Some("EDITOR.EXE"), "Notes one"),
+            window(2, Some("editor.exe"), "Notes two"),
+            window(3, Some("other.exe"), "Notes two"),
+            window(4, Some("editor.exe"), "Notes two"),
+            window(5, Some("editor.exe"), "Other two"),
+        ];
+        for window in &mut windows {
+            window.class_name = "editorclass".into();
+        }
+        windows[3].class_name = "OtherClass".into();
+        picker.refresh(windows, &args.window_filter());
+        assert_eq!(
+            picker.windows.iter().map(|w| w.handle).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(picker.query, "two");
+        assert_eq!(picker.matches, [1]);
+        assert_eq!(picker.preview.epoch, 1);
     }
 
     #[test]
@@ -496,21 +526,11 @@ mod tests {
             window(10, Some("notepad.exe"), "Shopping list"),
             window(20, Some("code.exe"), "Notes"),
         ];
-        assert_eq!(
-            pick(windows, None, &mut args).unwrap(),
-            Selection::Window(20)
-        );
+        assert_eq!(pick(windows, &mut args).unwrap(), Selection::Window(20));
         assert!(matches!(args.output.out_format, crate::OutputFormat::Webp));
         assert!(args.include_cursor);
         assert_eq!(terminal::is_raw_mode_enabled().unwrap(), raw_before);
-        assert!(
-            pick(
-                vec![window(10, None, "Cancel this picker")],
-                None,
-                &mut args
-            )
-            .is_err()
-        );
+        assert!(pick(vec![window(10, None, "Cancel this picker")], &mut args).is_err());
         assert_eq!(terminal::is_raw_mode_enabled().unwrap(), raw_before);
     }
 }

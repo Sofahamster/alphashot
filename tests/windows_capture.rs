@@ -26,8 +26,257 @@ use windows_sys::Win32::{
 
 static DESKTOP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+#[ignore = "Serial desktop integration: covered WGC CLI file/editor/clipboard output and native alpha association"]
+fn wgc_cli_keeps_native_alpha_and_uses_the_shared_output_pipeline() {
+    use std::{
+        process::{Command, Output, Stdio},
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::{
+        Foundation::SIZE,
+        System::{
+            DataExchange::*,
+            Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+            Ole::{CF_DIBV5, CF_HDROP},
+        },
+        UI::Shell::CFSTR_PREFERREDDROPEFFECT,
+    };
+
+    fn run(command: &mut Command) -> Output {
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            unsafe {
+                let mut message = zeroed();
+                while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "WGC CLI stalled: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn clipboard_bytes(format: u32) -> Vec<u8> {
+        unsafe {
+            let handle = GetClipboardData(format);
+            assert!(!handle.is_null());
+            let pointer = GlobalLock(handle).cast::<u8>();
+            assert!(!pointer.is_null());
+            let bytes = std::slice::from_raw_parts(pointer, GlobalSize(handle)).to_vec();
+            GlobalUnlock(handle);
+            bytes
+        }
+    }
+
+    let _desktop = DESKTOP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let target = Fixture::new();
+    let bounds = capture::centered(capture::list_monitors().unwrap()[0].work, 320, 220);
+    unsafe {
+        SetWindowLongPtrW(target.hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
+        SetWindowLongPtrW(
+            target.hwnd,
+            GWL_EXSTYLE,
+            (WS_EX_LAYERED | WS_EX_NOACTIVATE) as isize,
+        );
+        assert_ne!(
+            SetWindowPos(
+                target.hwnd,
+                null_mut(),
+                bounds.left,
+                bounds.top,
+                320,
+                220,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+            ),
+            0
+        );
+        let screen = GetDC(null_mut());
+        let dc = CreateCompatibleDC(screen);
+        let header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: 320,
+                biHeight: -220,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..zeroed()
+            },
+            ..zeroed()
+        };
+        let mut bits = null_mut();
+        let bitmap = CreateDIBSection(dc, &header, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        assert!(!bitmap.is_null());
+        let previous = SelectObject(dc, bitmap);
+        for (index, pixel) in std::slice::from_raw_parts_mut(bits.cast::<u8>(), 320 * 220 * 4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let alpha = [0u16, 64, 128, 255][index % 320 / 80];
+            pixel.copy_from_slice(&[
+                (40 * alpha / 255) as u8,
+                (100 * alpha / 255) as u8,
+                (200 * alpha / 255) as u8,
+                alpha as u8,
+            ]);
+        }
+        let origin = POINT::default();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..zeroed()
+        };
+        let updated = UpdateLayeredWindow(
+            target.hwnd,
+            screen,
+            null(),
+            &SIZE { cx: 320, cy: 220 },
+            dc,
+            &origin,
+            0,
+            &blend,
+            ULW_ALPHA,
+        );
+        SelectObject(dc, previous);
+        DeleteObject(bitmap);
+        DeleteDC(dc);
+        ReleaseDC(null_mut(), screen);
+        assert_ne!(updated, 0);
+    }
+    let cover = Fixture::new();
+    unsafe {
+        assert_ne!(
+            SetWindowPos(
+                cover.hwnd,
+                HWND_TOPMOST,
+                bounds.left - 20,
+                bounds.top - 20,
+                360,
+                260,
+                SWP_NOACTIVATE
+            ),
+            0
+        );
+        SetWindowLongPtrW(cover.hwnd, GWLP_USERDATA, 240);
+        InvalidateRect(cover.hwnd, null(), 0);
+        UpdateWindow(cover.hwnd);
+        assert!(windows_sys::Win32::Graphics::Dwm::DwmFlush() >= 0);
+    }
+    let before = saved_geometry(target.hwnd);
+    let foreground = unsafe { GetForegroundWindow() };
+    let directory = tempfile::tempdir().unwrap();
+    let out = directory.path().join("native transparent.png");
+    let common = [
+        "--backend",
+        "wgc",
+        "--no-preview",
+        "--no-crop",
+        "--pad",
+        "0",
+        "--window-hwnd",
+    ];
+    let saved = run(Command::new(env!("CARGO_BIN_EXE_alphashot"))
+        .args(common)
+        .arg(format!("0x{:X}", target.hwnd as usize))
+        .args(["--no-clipboard", "--out"])
+        .arg(&out)
+        .arg("--editor")
+        .arg(directory.path().join("missing editor.exe")));
+    assert_eq!(
+        String::from_utf8(saved.stdout).unwrap().trim(),
+        out.display().to_string()
+    );
+    assert!(
+        String::from_utf8_lossy(&saved.stderr).contains("Image saved, but editor launch failed")
+    );
+    let image = image::open(&out).unwrap().to_rgba8();
+    assert_eq!(image.dimensions(), (320, 220));
+    for (x, expected) in [
+        (40, [0; 4]),
+        (120, [199, 100, 40, 64]),
+        (200, [199, 100, 40, 128]),
+        (280, [200, 100, 40, 255]),
+    ] {
+        assert_eq!(image[(x, 110)].0, expected);
+    }
+    assert_eq!(saved_geometry(target.hwnd), before);
+    assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    let copied = run(Command::new(env!("CARGO_BIN_EXE_alphashot"))
+        .args(common)
+        .arg(format!("0x{:X}", target.hwnd as usize))
+        .arg("--clipboard-only")
+        .current_dir(directory.path()));
+    assert!(copied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&copied.stderr).contains("Copied"));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    assert_eq!(saved_geometry(target.hwnd), before);
+    assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+
+    struct Clipboard;
+    impl Drop for Clipboard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+    unsafe {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while OpenClipboard(null_mut()) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "Clipboard stayed busy after WGC CLI exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _clipboard = Clipboard;
+        let png = clipboard_bytes(RegisterClipboardFormatW(windows_sys::w!("PNG")));
+        assert_eq!(
+            image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8(),
+            image
+        );
+        let dib = clipboard_bytes(u32::from(CF_DIBV5));
+        let header = dib.as_ptr().cast::<BITMAPV5HEADER>().read_unaligned();
+        assert_eq!((header.bV5Width, header.bV5Height), (320, 220));
+        let sample = 124 + ((220 - 1 - 110) * 320 + 120) * 4;
+        assert_eq!(&dib[sample..sample + 4], &[10, 25, 50, 64]);
+        assert!(GetClipboardData(u32::from(CF_HDROP)).is_null());
+        assert!(GetClipboardData(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT)).is_null());
+    }
+}
+
 #[path = "../src/sixel.rs"]
 mod sixel;
+
+#[path = "../src/session.rs"]
+#[allow(dead_code)]
+mod session;
 
 #[test]
 #[ignore = "Uses disposable desktop windows to verify occluded WGC snapshots and measure the release preview pipeline"]
@@ -74,7 +323,11 @@ fn snapshots_occluded_windows_without_changing_focus_or_placement() {
                 [68, 136, 204, 255],
                 "Must capture the blue target, not its grey occluder"
             );
-            assert!(image.pixels().all(|p| p[3] == 255));
+            assert!(
+                image
+                    .pixels()
+                    .all(|pixel| pixel[3] != 0 || pixel.0 == [0; 4])
+            );
             let dimensions = (image.width(), image.height());
             let started = Instant::now();
             let cached = if image.width() > 1024 || image.height() > 768 {
@@ -275,6 +528,451 @@ impl Drop for Fixture {
     }
 }
 
+struct GeometryFixture {
+    window: Fixture,
+    state: Box<GeometryFixtureState>,
+}
+
+struct GeometryFixtureState {
+    custom_frame: bool,
+    refuse_size: bool,
+    requested: (u32, u32),
+    saw_requested: bool,
+    cancel_on_resize: Option<std::sync::Arc<AtomicBool>>,
+}
+
+impl GeometryFixture {
+    fn new(custom_frame: bool) -> Self {
+        let mut fixture = Self {
+            window: Fixture::new(),
+            state: Box::new(GeometryFixtureState {
+                custom_frame,
+                refuse_size: false,
+                requested: (640, 420),
+                saw_requested: false,
+                cancel_on_resize: None,
+            }),
+        };
+        unsafe {
+            SetWindowLongPtrW(
+                fixture.window.hwnd,
+                GWLP_USERDATA,
+                (&mut *fixture.state as *mut GeometryFixtureState) as isize,
+            );
+            SetWindowLongPtrW(
+                fixture.window.hwnd,
+                GWLP_WNDPROC,
+                geometry_fixture_proc as *const () as isize,
+            );
+            SetWindowPos(
+                fixture.window.hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        fixture
+    }
+}
+
+unsafe extern "system" fn geometry_fixture_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    unsafe {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut GeometryFixtureState;
+        if !state.is_null() {
+            if message == WM_NCCALCSIZE && (*state).custom_frame {
+                let client = if wparam != 0 {
+                    &mut (*(lparam as *mut NCCALCSIZE_PARAMS)).rgrc[0]
+                } else {
+                    &mut *(lparam as *mut RECT)
+                };
+                // Changing chrome at a width threshold requires another measured adjustment.
+                let inset = if client.right - client.left >= 600 {
+                    24
+                } else {
+                    8
+                };
+                client.left += inset;
+                client.top += inset;
+                client.right -= inset;
+                client.bottom -= inset;
+                return 0;
+            }
+            if message == WM_WINDOWPOSCHANGING && (*state).refuse_size {
+                let position = &mut *(lparam as *mut WINDOWPOS);
+                if position.flags & SWP_NOSIZE == 0 {
+                    position.cx = position.cx.min(480);
+                    position.cy = position.cy.min(320);
+                }
+            }
+        }
+        let result = DefWindowProcW(hwnd, message, wparam, lparam);
+        if !state.is_null() && message == WM_SIZE && wparam != SIZE_MINIMIZED as usize {
+            let mut client = RECT::default();
+            assert_ne!(GetClientRect(hwnd, &mut client), 0);
+            if (client.right as u32, client.bottom as u32) == (*state).requested {
+                (*state).saw_requested = true;
+                if let Some(cancelled) = &(*state).cancel_on_resize {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        result
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SavedGeometry {
+    outer: Rect,
+    flags: u32,
+    show_command: u32,
+    minimized_position: Option<(i32, i32)>,
+    maximized_position: (i32, i32),
+    normal: Rect,
+}
+
+fn saved_geometry(hwnd: HWND) -> SavedGeometry {
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..unsafe { zeroed() }
+    };
+    assert_ne!(unsafe { GetWindowPlacement(hwnd, &mut placement) }, 0);
+    let normal = placement.rcNormalPosition;
+    SavedGeometry {
+        outer: capture::window_info(hwnd as usize).unwrap().rect,
+        flags: placement.flags,
+        show_command: placement.showCmd,
+        // Windows ignores ptMinPosition unless WPF_SETMINPOSITION is set.
+        minimized_position: (placement.flags & WPF_SETMINPOSITION != 0)
+            .then_some((placement.ptMinPosition.x, placement.ptMinPosition.y)),
+        maximized_position: (placement.ptMaxPosition.x, placement.ptMaxPosition.y),
+        normal: Rect {
+            left: normal.left,
+            top: normal.top,
+            right: normal.right,
+            bottom: normal.bottom,
+        },
+    }
+}
+
+#[test]
+#[ignore = "Uses an interactive Windows desktop and resizes native and custom-frame fixture windows"]
+fn captures_exact_client_sizes_and_restores_window_states() {
+    let _desktop = DESKTOP_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for custom_frame in [false, true] {
+        let mut fixture = GeometryFixture::new(custom_frame);
+        for (state, show) in [
+            ("normal", SW_SHOWNORMAL),
+            ("minimized", SW_MINIMIZE),
+            ("maximized", SW_MAXIMIZE),
+            ("minimized-from-maximized", SW_MINIMIZE),
+        ] {
+            unsafe { ShowWindow(fixture.window.hwnd, show) };
+            let before = saved_geometry(fixture.window.hwnd);
+            fixture.state.saw_requested = false;
+            let requested = fixture.state.requested;
+            let pair = capture::capture(
+                fixture.window.hwnd as usize,
+                &CaptureOptions {
+                    client_size: Some(requested),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "custom_frame={custom_frame}, state={state}, requested={requested:?}: {error:#}"
+                )
+            });
+            assert!(
+                fixture.state.saw_requested,
+                "custom_frame={custom_frame}, state={state}"
+            );
+            assert_eq!(pair.white.dimensions(), pair.black.dimensions());
+            assert!(pair.white.width() >= requested.0);
+            assert!(pair.white.height() >= requested.1);
+            assert_eq!(
+                saved_geometry(fixture.window.hwnd),
+                before,
+                "custom_frame={custom_frame}, state={state}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "Uses an interactive Windows desktop to check native corner masking, exact client sizing, maximized bounds and restoration"]
+fn no_shadow_retains_native_and_maximized_chrome() {
+    let _desktop = DESKTOP_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let fixture = Fixture::new();
+    let before = saved_geometry(fixture.hwnd);
+    let foreground = unsafe { GetForegroundWindow() };
+    let style = unsafe { GetWindowLongPtrW(fixture.hwnd, GWL_STYLE) };
+    let native = capture::capture(
+        fixture.hwnd as usize,
+        &CaptureOptions {
+            no_shadow: true,
+            client_size: Some((640, 420)),
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(native.blend_space, alphashot::alpha::BlendSpace::Srgb);
+    let image = recover(
+        &native.white,
+        &native.black,
+        &AlphaOptions {
+            blend_space: native.blend_space,
+            corner_radius: native.corner_radius,
+            crop: false,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .image;
+    assert!(image.width() >= 640 && image.height() > 420);
+    if native.corner_radius > 0.0 {
+        assert_eq!(image[(0, 0)].0, [0; 4]);
+        assert!(image.pixels().any(|p| p[3] > 0 && p[3] < 255));
+    }
+    eprintln!(
+        "Native SDR center: white={:?}, black={:?}, rgba={:?}, dpi={}",
+        native.white[(image.width() / 2, image.height() / 2)].0,
+        native.black[(image.width() / 2, image.height() / 2)].0,
+        image[(image.width() / 2, image.height() / 2)].0,
+        native.window.dpi
+    );
+    assert_eq!(
+        image[(image.width() / 2, image.height() / 2)].0,
+        [0x44, 0x88, 0xcc, 255]
+    );
+    assert_eq!(saved_geometry(fixture.hwnd), before);
+    assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    assert_eq!(unsafe { GetWindowLongPtrW(fixture.hwnd, GWL_STYLE) }, style);
+
+    unsafe { ShowWindow(fixture.hwnd, SW_MAXIMIZE) };
+    let before = saved_geometry(fixture.hwnd);
+    let frame = frame(fixture.hwnd);
+    let pair = capture::capture(
+        fixture.hwnd as usize,
+        &CaptureOptions {
+            no_shadow: true,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(pair.blend_space, alphashot::alpha::BlendSpace::Srgb);
+    assert_eq!(
+        pair.white.dimensions(),
+        (frame.width() as u32, frame.height() as u32)
+    );
+    assert!(
+        pair.opaque_regions.is_empty(),
+        "No-shadow capture must retain client alpha"
+    );
+    let image = recover(
+        &pair.white,
+        &pair.black,
+        &AlphaOptions {
+            corner_radius: pair.corner_radius,
+            crop: false,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .image;
+    let mut client = RECT::default();
+    assert_ne!(unsafe { GetClientRect(fixture.hwnd, &mut client) }, 0);
+    assert!(
+        image.height() > client.bottom as u32,
+        "The native title bar must remain in the image"
+    );
+    assert_eq!(
+        image[(image.width() / 2, image.height() / 2)].0,
+        [0x44, 0x88, 0xcc, 255]
+    );
+    assert_eq!(saved_geometry(fixture.hwnd), before);
+}
+
+#[test]
+#[ignore = "Uses an interactive Windows desktop and an application-constrained disposable window"]
+fn refuses_constrained_client_sizes_and_restores_geometry() {
+    let _desktop = DESKTOP_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut fixture = GeometryFixture::new(false);
+    let before = saved_geometry(fixture.window.hwnd);
+    let mut client = RECT::default();
+    assert_ne!(
+        unsafe { GetClientRect(fixture.window.hwnd, &mut client) },
+        0
+    );
+    let actual = (
+        480 - (before.outer.width() - client.right),
+        320 - (before.outer.height() - client.bottom),
+    );
+    fixture.state.refuse_size = true;
+    let error = capture::capture(
+        fixture.window.hwnd as usize,
+        &CaptureOptions {
+            client_size: Some(fixture.state.requested),
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(error.contains("Requested client size 640x420"), "{error}");
+    assert!(
+        error.contains(&format!("actual client size {}x{}", actual.0, actual.1)),
+        "{error}"
+    );
+    assert_eq!(saved_geometry(fixture.window.hwnd), before);
+}
+
+#[test]
+#[ignore = "Uses an interactive Windows desktop and cancels or fails after resizing disposable windows"]
+fn restores_client_geometry_after_cancellation_and_workspace_failure() {
+    let _desktop = DESKTOP_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut fixture = GeometryFixture::new(false);
+    for show in [SW_SHOWNORMAL, SW_MAXIMIZE, SW_MINIMIZE] {
+        unsafe { ShowWindow(fixture.window.hwnd, show) };
+        let before = saved_geometry(fixture.window.hwnd);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        fixture.state.cancel_on_resize = Some(std::sync::Arc::clone(&cancelled));
+        fixture.state.saw_requested = false;
+        let error = capture::capture(
+            fixture.window.hwnd as usize,
+            &CaptureOptions {
+                client_size: Some(fixture.state.requested),
+                ..Default::default()
+            },
+            &cancelled,
+        )
+        .err()
+        .unwrap();
+        fixture.state.cancel_on_resize = None;
+        assert!(fixture.state.saw_requested);
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert_eq!(saved_geometry(fixture.window.hwnd), before);
+    }
+
+    unsafe { ShowWindow(fixture.window.hwnd, SW_RESTORE) };
+    let before = saved_geometry(fixture.window.hwnd);
+    let work = capture::list_monitors().unwrap()[0].work;
+    fixture.state.requested = ((work.width() - 100).max(320) as u32, 220);
+    fixture.state.saw_requested = false;
+    let error = capture::capture(
+        fixture.window.hwnd as usize,
+        &CaptureOptions {
+            client_size: Some(fixture.state.requested),
+            pad_mode: capture::PadMode::Uniform,
+            pad: 4096,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+    )
+    .err()
+    .unwrap();
+    assert!(fixture.state.saw_requested);
+    assert!(error.to_string().contains("workspace"), "{error}");
+    assert!(
+        error.to_string().contains("Requested client size"),
+        "{error}"
+    );
+    assert_eq!(saved_geometry(fixture.window.hwnd), before);
+}
+
+#[test]
+#[ignore = "Captures a disposable window repeatedly after changing its content and title"]
+fn repeated_capture_keeps_target_settings_and_restores_the_desktop() {
+    use alphashot::output::{self, SaveOptions};
+    let _desktop = DESKTOP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let original = capture::window_info(fixture.hwnd as usize).unwrap();
+    let target = session::Target::new(&original);
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut cursor = POINT::default();
+    assert_ne!(unsafe { GetCursorPos(&mut cursor) }, 0);
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().join("session.png");
+    std::fs::write(directory.path().join("session-0001.png"), b"keep image").unwrap();
+    std::fs::write(directory.path().join("capture-0002-white.png"), b"keep raw").unwrap();
+    let options = CaptureOptions::default();
+    let cancelled = AtomicBool::new(false);
+    let mut number = 0;
+    for (index, color) in [40_u8, 220].into_iter().enumerate() {
+        let title = format!("Changed session title {index}");
+        let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            assert_ne!(SetWindowTextW(fixture.hwnd, wide.as_ptr()), 0);
+            SetWindowLongPtrW(fixture.hwnd, GWLP_USERDATA, isize::from(color));
+            InvalidateRect(fixture.hwnd, null(), 0);
+            UpdateWindow(fixture.hwnd);
+        }
+        assert_eq!(target.window().unwrap().title, title);
+        let paths =
+            session::Paths::next(Some(&base), Some(directory.path()), "capture", &mut number)
+                .unwrap();
+        assert_eq!(number, index as u64 + 3);
+        let capture = capture::capture(fixture.hwnd as usize, &options, &cancelled).unwrap();
+        let result = recover(
+            &capture.white,
+            &capture.black,
+            &AlphaOptions {
+                crop: false,
+                opaque_regions: capture.opaque_regions,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.image[(result.image.width() / 2, result.image.height() / 2)].0,
+            [color, color, color, 255]
+        );
+        let image = paths.image.unwrap();
+        output::save(&result.image, &image, &SaveOptions::default()).unwrap();
+        let (white, black) = paths.raw.unwrap();
+        output::save_composite(&capture.white, &white, capture.window.dpi, false).unwrap();
+        output::save_composite(&capture.black, &black, capture.window.dpi, false).unwrap();
+        assert!(image::open(image).unwrap().color().has_alpha());
+        assert_eq!(target.window().unwrap().rect, original.rect);
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        let mut after = POINT::default();
+        assert_ne!(unsafe { GetCursorPos(&mut after) }, 0);
+        assert_eq!((after.x, after.y), (cursor.x, cursor.y));
+    }
+    assert_eq!(
+        std::fs::read(directory.path().join("session-0001.png")).unwrap(),
+        b"keep image"
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("capture-0002-white.png")).unwrap(),
+        b"keep raw"
+    );
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 8);
+    assert_ne!(unsafe { DestroyWindow(fixture.hwnd) }, 0);
+    let error = target.window().unwrap_err();
+    assert!(error.to_string().contains("closed or unavailable"));
+    assert!(error.to_string().contains("restart --repeat"));
+}
+
 #[test]
 #[ignore = "Uses an interactive Windows desktop and briefly shows a disposable test window"]
 fn captures_real_window_and_restores_it_on_success_and_cancel() {
@@ -443,16 +1141,43 @@ fn captures_real_window_and_restores_it_on_success_and_cancel() {
         String::from_utf8_lossy(&alias.stderr).contains("must differ from the raw capture paths")
     );
     {
-        let _duplicate = Fixture::new();
+        let duplicate = Fixture::new();
+        let title = format!("Alphashot targeting ambiguity {}", std::process::id());
+        let wide_title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        for hwnd in [fixture.hwnd, duplicate.hwnd] {
+            assert_ne!(unsafe { SetWindowTextW(hwnd, wide_title.as_ptr()) }, 0);
+        }
+        let ambiguous_out = directory.path().join("ambiguous.png");
         let ambiguous = std::process::Command::new(env!("CARGO_BIN_EXE_alphashot"))
-            .args(["--window-title", "Alphashot capture test"])
+            .args([
+                "--window-title",
+                &title,
+                "--process",
+                executable.file_name().unwrap().to_str().unwrap(),
+                "--wait",
+                "0",
+                "--no-clipboard",
+                "--out",
+            ])
+            .arg(&ambiguous_out)
             .output()
             .unwrap();
         assert_eq!(ambiguous.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&ambiguous.stderr);
         assert!(
-            String::from_utf8_lossy(&ambiguous.stderr).contains("2 windows matched --window-title")
+            error.contains("2 windows matched the requested selectors"),
+            "{error}"
         );
+        assert!(error.contains("narrow --window-title"), "{error}");
+        assert!(error.contains("--process or --window-class"), "{error}");
+        assert!(error.contains("--window-hwnd"), "{error}");
+        for hwnd in [fixture.hwnd, duplicate.hwnd] {
+            let window = capture::window_info(hwnd as usize).unwrap();
+            assert!(error.contains(&format!("0x{:X}", window.handle)), "{error}");
+            assert!(error.contains(&window.class_name), "{error}");
+        }
         assert!(ambiguous.stdout.is_empty());
+        assert!(!ambiguous_out.exists());
     }
     let mut placement: WINDOWPLACEMENT = unsafe { zeroed() };
     placement.length = size_of::<WINDOWPLACEMENT>() as u32;
@@ -476,6 +1201,94 @@ fn captures_real_window_and_restores_it_on_success_and_cancel() {
         capture::window_info(fixture.hwnd as usize).unwrap().rect,
         original
     );
+}
+
+#[test]
+#[ignore = "Uses an interactive desktop to list, hide and show a disposable untitled window"]
+fn lists_combined_selectors_and_waits_for_an_untitled_window() {
+    use std::process::Command;
+    let _desktop = DESKTOP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = Fixture::new();
+    let info = capture::window_info(fixture.hwnd as usize).unwrap();
+    let process = info.process_name.as_ref().unwrap().to_uppercase();
+    let class = info.class_name.to_uppercase();
+    let list = |selectors: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_alphashot"))
+            .arg("--list-windows")
+            .args(selectors)
+            .output()
+            .unwrap()
+    };
+    let result = list(&[
+        "--window-title",
+        "CAPTURE TEST",
+        "--process",
+        &process,
+        "--window-class",
+        &class,
+    ]);
+    assert!(result.status.success());
+    let table = String::from_utf8(result.stdout).unwrap();
+    assert_eq!(table.lines().count(), 2, "{table}");
+    assert!(table.lines().next().unwrap().ends_with("\tclass"));
+    for selectors in [
+        vec![
+            "--process",
+            "__alphashot_missing__.exe",
+            "--window-class",
+            &class,
+        ],
+        vec!["--process", &process, "--window-class", "__missing_class__"],
+    ] {
+        let result = list(&selectors);
+        assert!(result.status.success());
+        assert_eq!(String::from_utf8(result.stdout).unwrap().lines().count(), 1);
+    }
+    unsafe {
+        assert_ne!(SetWindowTextW(fixture.hwnd, [0_u16].as_ptr()), 0);
+        ShowWindow(fixture.hwnd, SW_HIDE);
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_alphashot"))
+        .args([
+            "--list-windows",
+            "--process",
+            &process,
+            "--window-class",
+            &class,
+            "--wait",
+            "2",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none());
+    unsafe {
+        ShowWindow(fixture.hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(fixture.hwnd);
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let table = String::from_utf8(result.stdout).unwrap();
+    let fields: Vec<_> = table.lines().nth(1).unwrap().split('\t').collect();
+    assert_eq!(fields[0], format!("0x{:X}", fixture.hwnd as usize));
+    assert!(
+        fields[6].is_empty(),
+        "An untitled window must keep its empty title"
+    );
+    assert_eq!(fields[7], info.class_name);
+    unsafe {
+        ShowWindow(fixture.hwnd, SW_HIDE);
+    }
+    let result = list(&["--window-class", &class, "--wait", "0"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("within 0 seconds"));
 }
 
 #[test]
@@ -1074,6 +1887,10 @@ fn captures_menu_wider_than_parent_with_zero_extra_padding() {
                 },
                 CaptureOptions {
                     high_dpi: true,
+                    ..Default::default()
+                },
+                CaptureOptions {
+                    client_size: Some((640, 420)),
                     ..Default::default()
                 },
             ] {

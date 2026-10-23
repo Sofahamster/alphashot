@@ -17,4 +17,4 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           files: target/release/alphashot.exe
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md

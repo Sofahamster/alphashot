@@ -1,9 +1,10 @@
-//! Opaque picker thumbnails through Windows Graphics Capture (WGC).
+//! Native window pixels through Windows Graphics Capture (WGC).
 //!
 //! WGC reads a window's own composition surface, so covered and partly off-screen windows show
 //! their content, and the window is not activated, raised or moved. `BitBlt` or desktop
 //! duplication would show whatever covers the window. WGC omits the desktop behind the window,
-//! which rules it out for the two-backdrop capture; thumbnails get alpha 255.
+//! which rules it out for the two-backdrop solve. Its premultiplied alpha is converted to
+//! straight RGBA without forcing client pixels opaque.
 //!
 //! # Threading
 //!
@@ -30,7 +31,10 @@ use std::{
 };
 use windows::{
     Graphics::{
-        Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
+        Capture::{
+            Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+            IDirect3D11CaptureFramePoolStatics2, IGraphicsCaptureSessionStatics,
+        },
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
     },
     Win32::{
@@ -67,6 +71,7 @@ pub struct Snapshotter {
     context: ID3D11DeviceContext,
     winrt: IDirect3DDevice,
     interop: IGraphicsCaptureItemInterop,
+    pool_factory: IDirect3D11CaptureFramePoolStatics2,
     _apartment: Apartment,
 }
 
@@ -96,10 +101,15 @@ impl Snapshotter {
             RoInitialize(RO_INIT_MULTITHREADED)?;
         }
         let apartment = Apartment(std::marker::PhantomData);
-        ensure!(
-            GraphicsCaptureSession::IsSupported()?,
-            "Windows Graphics Capture is unavailable"
-        );
+        // Generated static methods cache factories past apartment teardown and DLL unloading.
+        let session_factory = factory::<GraphicsCaptureSession, IGraphicsCaptureSessionStatics>()?;
+        let mut supported = false;
+        // SAFETY: the owned factory lives in this apartment; supported is a valid out parameter.
+        unsafe {
+            (session_factory.vtable().IsSupported)(session_factory.as_raw(), &mut supported)
+                .ok()?;
+        }
+        ensure!(supported, "Windows Graphics Capture is unavailable");
         let (mut device, mut context) = (None, None);
         // SAFETY: D3D_DRIVER_TYPE_HARDWARE requires no adapter and no software module; the out
         // parameters are live `Option`s that receive owned interfaces.
@@ -125,24 +135,49 @@ impl Snapshotter {
             context: context.context("No D3D11 context")?,
             winrt,
             interop: factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?,
+            pool_factory: factory::<Direct3D11CaptureFramePool, IDirect3D11CaptureFramePoolStatics2>(
+            )?,
             _apartment: apartment,
         })
     }
 
-    /// Takes one opaque RGBA snapshot of the window `handle`.
+    /// Takes one straight-alpha RGBA snapshot of the window `handle`.
     ///
     /// # Errors
     ///
     /// Fails if the window is closed, minimized, empty, above 40 million pixels or resized, if
     /// frame and readback exceed 500 ms, if `cancelled` returns `true`, and on WGC or D3D errors.
     pub fn capture(&self, handle: usize, cancelled: impl Fn() -> bool) -> Result<RgbaImage> {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
+        let mut image = self.capture_raw(handle, cancelled)?;
+        for pixel in image.pixels_mut() {
+            pixel.0 = unpremultiply(pixel.0);
+        }
+        Ok(image)
+    }
+
+    fn capture_raw(&self, handle: usize, cancelled: impl Fn() -> bool) -> Result<RgbaImage> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowDisplayAffinity, IsIconic, IsWindow, IsWindowVisible,
+        };
         ensure!(
             // SAFETY: IsWindow and IsIconic accept any handle value and dereference nothing.
-            unsafe { IsWindow(handle as _) } != 0 && unsafe { IsIconic(handle as _) } == 0,
-            "Window is closed or minimized"
+            unsafe { IsWindow(handle as _) } != 0,
+            "WGC target window is closed"
         );
-        ensure!(!cancelled(), "Preview cancelled");
+        // SAFETY: these functions only read window state; affinity is a live u32 output.
+        unsafe {
+            ensure!(IsIconic(handle as _) == 0, "WGC target window is minimized");
+            ensure!(
+                IsWindowVisible(handle as _) != 0,
+                "WGC target window is hidden"
+            );
+            let mut affinity = 0;
+            ensure!(
+                GetWindowDisplayAffinity(handle as _, &mut affinity) == 0 || affinity == 0,
+                "WGC target excludes screen capture through display affinity"
+            );
+        }
+        ensure!(!cancelled(), "WGC capture cancelled");
         // SAFETY: CreateForWindow validates the HWND and fails for a window closed since the
         // check above; the interop factory lives as long as `&self`.
         let item: GraphicsCaptureItem = unsafe { self.interop.CreateForWindow(HWND(handle as _))? };
@@ -151,25 +186,38 @@ impl Snapshotter {
             size.Width > 0
                 && size.Height > 0
                 && i64::from(size.Width) * i64::from(size.Height) <= 40_000_000,
-            "Preview window is too large or empty"
+            "WGC window is too large or empty"
         );
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &self.winrt,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            1,
-            size,
-        )?;
+        // SAFETY: the apartment owns this uncached factory and device; size was validated,
+        // and Type::from_abi takes ownership of the returned frame pool after a successful call.
+        let pool: Direct3D11CaptureFramePool = unsafe {
+            let mut result = std::ptr::null_mut();
+            (self.pool_factory.vtable().CreateFreeThreaded)(
+                self.pool_factory.as_raw(),
+                self.winrt.as_raw(),
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                1,
+                size,
+                &mut result,
+            )
+            .and_then(|| windows::core::Type::from_abi(result))?
+        };
         let session = Session {
             capture: pool.CreateCaptureSession(&item)?,
             pool,
         };
-        let _ = session.capture.SetIsCursorCaptureEnabled(false);
+        session.capture.SetIsCursorCaptureEnabled(false).context("Cannot disable native WGC cursor capture; WGC and picker previews require Windows 10 version 2004 (build 19041) or newer")?;
         // Best effort without consent prompts; Windows may still draw the border.
         let _ = session.capture.SetIsBorderRequired(false);
         session.capture.StartCapture()?;
         let deadline = Instant::now() + Duration::from_millis(500);
         let frame = loop {
-            ensure!(!cancelled(), "Preview cancelled");
+            ensure!(!cancelled(), "WGC capture cancelled");
+            ensure!(
+                // SAFETY: IsWindow accepts an HWND by value and reads no application memory.
+                unsafe { IsWindow(handle as _) } != 0,
+                "WGC target closed during capture"
+            );
             if let Ok(frame) = session.pool.TryGetNextFrame() {
                 break frame;
             }
@@ -179,7 +227,7 @@ impl Snapshotter {
         let content = frame.ContentSize()?;
         ensure!(
             content.Width == size.Width && content.Height == size.Height,
-            "Window resized during preview"
+            "Window resized during WGC capture"
         );
         let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
         // SAFETY: the surface belongs to this device, so the access yields an ID3D11Texture2D;
@@ -215,7 +263,7 @@ impl Snapshotter {
         loop {
             ensure!(
                 !cancelled() && Instant::now() < deadline,
-                "Preview readback timed out or cancelled"
+                "WGC readback timed out or cancelled"
             );
             // SAFETY: `staging` has CPU read access and subresource 0; `mapped` is a live out
             // parameter. DO_NOT_WAIT reports a busy GPU as an error so the loop can poll.
@@ -239,7 +287,7 @@ impl Snapshotter {
         let _ = frame.Close();
         drop(session);
         let image = if mapped.pData.is_null() || mapped.RowPitch < size.Width as u32 * 4 {
-            Err(anyhow::anyhow!("Invalid preview row pitch"))
+            Err(anyhow::anyhow!("Invalid WGC row pitch"))
         } else {
             let mut image = RgbaImage::new(size.Width as u32, size.Height as u32);
             for (y, row) in image
@@ -263,7 +311,7 @@ impl Snapshotter {
                     .iter_mut()
                     .zip(source.as_chunks::<4>().0)
                 {
-                    out.copy_from_slice(&[bgra[2], bgra[1], bgra[0], 255]);
+                    out.copy_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
                 }
             }
             Ok(image)
@@ -275,3 +323,16 @@ impl Snapshotter {
         image
     }
 }
+
+fn unpremultiply([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    if a == 0 {
+        return [0; 4];
+    }
+    let straight =
+        |color| ((u16::from(color) * 255 + u16::from(a) / 2) / u16::from(a)).min(255) as u8;
+    [straight(r), straight(g), straight(b), a]
+}
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;

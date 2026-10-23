@@ -1,6 +1,6 @@
 [package]
 name = "alphashot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Capture Windows windows with transparent backgrounds, rounded corners and shadows"
@@ -10,7 +10,7 @@ repository = "https://github.com/Sofahamster/alphashot"
 readme = "README.md"
 keywords = ["screenshot", "windows", "transparency", "capture", "dwm"]
 categories = ["command-line-utilities", "multimedia::images"]
-include = ["/src", "/tests", "/README.md", "/LICENSE-*", "/Cargo.toml", "/Cargo.lock"]
+include = ["/src", "/tests", "/README.md", "/RELEASE_NOTES.md", "/LICENSE-*", "/Cargo.toml", "/Cargo.lock"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-pc-windows-msvc"]
@@ -29,7 +29,7 @@ unicode-width = "0.2.2"
 [target.'cfg(windows)'.dependencies]
 ctrlc = "3.5"
 windows = { version = "0.62", features = ["Graphics_Capture", "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_ColorSystem", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = "thin"
